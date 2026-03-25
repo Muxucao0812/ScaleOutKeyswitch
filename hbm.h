@@ -109,6 +109,7 @@ private:
     uint64_t capacity_bytes_;
     uint32_t num_channels_;
     uint32_t pseudo_channels_per_channel_;
+    uint32_t pseudo_channel_bytes_;
     uint32_t burst_bytes_;
     uint32_t base_access_cycles_;
     uint32_t burst_cycles_;
@@ -116,6 +117,7 @@ private:
     uint32_t network_return_cycles_;
     bool nttu_twiddle_from_hbm_;
     CryptoContext context_;
+
 
     std::vector<std::deque<ChannelRequest>> channel_queues_;
     std::vector<bool> channel_active_valid_;

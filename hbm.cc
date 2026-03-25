@@ -43,6 +43,7 @@ HBM::HBM(SST::ComponentId_t id, SST::Params& params) :
     network_return_cycles_(params.find<uint32_t>("network_return_cycles", 4)),
     nttu_twiddle_from_hbm_(false),
     context_(loadCryptoContext(params, 8192, 32, 1)),
+    pseudo_channel_bytes_(0),
     current_cycle_(0)
 {
     const uint32_t verbose = params.find<uint32_t>("verbose", 0);
@@ -65,6 +66,19 @@ HBM::HBM(SST::ComponentId_t id, SST::Params& params) :
     channel_queues_.resize(total_channels);
     channel_active_valid_.resize(total_channels, false);
     channel_active_.resize(total_channels);
+
+    pseudo_channel_bytes_ = capacity_bytes_ / total_channels;
+    if (pseudo_channel_bytes_ == 0) {
+        pseudo_channel_bytes_ = 1;
+    }
+
+    output_.verbose(
+        CALL_INFO,
+        1,
+        0,
+        "Configured pseudo-channels: total=%u bytes_per_pc=%llu\n",
+        total_channels,
+        static_cast<unsigned long long>(pseudo_channel_bytes_));
 
     const std::string clock = params.find<std::string>("clock", "1.2GHz");
     registerClock(clock, new SST::Clock::Handler2<HBM, &HBM::tick>(this));
@@ -268,15 +282,17 @@ void HBM::enqueueMemoryRequest(
             forward_to_compute,
             respond_to_fabric,
         });
+
     output_.verbose(
         CALL_INFO,
         2,
         0,
-        "Enqueue channel req: ch=%u inst=%llu txn=%llu opcode=%s bytes=%llu qdepth=%zu\n",
+        "Enqueue channel req: ch=%u inst=%llu txn=%llu opcode=%s addr=0x%llx bytes=%llu qdepth=%zu\n",
         channel,
         static_cast<unsigned long long>(event->parent_instruction_id),
         static_cast<unsigned long long>(event->txn_id),
         Instruction::opcodeName(static_cast<Instruction::Opcode>(event->opcode)),
+        static_cast<unsigned long long>(address),
         static_cast<unsigned long long>(bytes),
         channel_queues_[channel].size());
 }
@@ -432,8 +448,13 @@ uint64_t HBM::twiddleBytesForEvent(const AcceleratorEvent& event) const
 uint32_t HBM::mapToChannel(uint64_t address) const
 {
     const uint32_t total_channels = static_cast<uint32_t>(channel_queues_.size());
-    const uint64_t bucket = address / std::max<uint32_t>(1, burst_bytes_);
-    return static_cast<uint32_t>(bucket % std::max<uint32_t>(1, total_channels));
+    if (total_channels == 0) {
+        return 0;
+    }
+
+    const uint64_t pc_bytes = std::max<uint64_t>(1, pseudo_channel_bytes_);
+    const uint64_t pc_index = address / pc_bytes;
+    return static_cast<uint32_t>(pc_index % total_channels);
 }
 
 bool HBM::withinCapacity(uint64_t address, uint64_t bytes) const
@@ -462,6 +483,7 @@ bool HBM::hasReadyRegion(uint64_t start, uint64_t bytes, uint64_t cycle) const
 void HBM::markValidRegion(uint64_t start, uint64_t bytes, uint64_t ready_cycle)
 {
     valid_regions_.push_back({start, bytes, ready_cycle, true});
+
     std::sort(
         valid_regions_.begin(),
         valid_regions_.end(),
