@@ -106,10 +106,9 @@ def main():
     cpu.addParams(
         {
             "clock": Hardware.cpu_clock,
-            "issue_width": 4,
-            "max_inflight": 32,
+            "issue_width": 1,
+            "max_inflight": 1,
             "default_lanes": NUM_LANES,
-            "default_modulus": 65537,
             "instructions_to_generate": 1,
             "default_src_address": 0x10000000,
             "default_dst_address": 0x10080000,
@@ -197,8 +196,8 @@ def main():
         (hbm, "fabric", "4ns"),
     )
 
-    hbm_compute = sst.Link("hbm_compute")
-    hbm_compute.connect(
+    axi_interconnect = sst.Link("axi_interconnect")
+    axi_interconnect.connect(
         (hbm, "compute", "2ns"),
         (compute_unit, "hbm", "2ns"),
     )
