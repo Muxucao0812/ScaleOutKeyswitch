@@ -1,0 +1,1 @@
+python3 test.py --inputs_file=program_inputs --instructions_file=instructions

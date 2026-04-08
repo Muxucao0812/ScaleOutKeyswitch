@@ -1,0 +1,26 @@
+# Copyright (c) Siddharth Jayashankar. All rights reserved.
+# Licensed under the MIT license.
+
+from setuptools import setup, find_packages
+from setuptools.dist import Distribution
+
+class BinaryDistribution(Distribution):
+    """Distribution which always forces a binary package with platform name"""
+    def has_ext_modules(foo):
+        return True
+
+setup(
+    name='cinnamon',
+    version='${PROJECT_VERSION}',
+    author='Siddharth Jayashankar',
+    author_email='sidjay@cmu.edu',
+    description='Compiler for the Cinnamon Framework for Encrypted AI',
+    packages=find_packages('${CMAKE_CURRENT_BINARY_DIR}'),
+    package_data={
+        'cinnamon': ['$<TARGET_FILE_NAME:cinnamon_py>'],
+    },
+    distclass=BinaryDistribution,
+    install_requires=[
+        'psutil',
+    ],
+)

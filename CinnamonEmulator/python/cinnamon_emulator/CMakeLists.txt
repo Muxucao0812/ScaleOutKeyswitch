@@ -1,0 +1,7 @@
+pybind11_add_module(cinnamon_emulator_py
+    wrapper.cpp
+)
+
+target_compile_features(cinnamon_emulator_py PUBLIC cxx_std_17)
+target_link_libraries(cinnamon_emulator_py PRIVATE cinnamon_emulator)
+set_target_properties(cinnamon_emulator_py PROPERTIES OUTPUT_NAME _cinnamon_emulator)

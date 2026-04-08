@@ -1,0 +1,13 @@
+pyproject.toml
+setup.py
+cinnamon_fpga/__init__.py
+cinnamon_fpga/api.py
+cinnamon_fpga/parser.py
+cinnamon_fpga/pyxrt_runner.py
+cinnamon_fpga/smoke.py
+cinnamon_fpga.egg-info/PKG-INFO
+cinnamon_fpga.egg-info/SOURCES.txt
+cinnamon_fpga.egg-info/dependency_links.txt
+cinnamon_fpga.egg-info/top_level.txt
+tests/test_api_helpers.py
+tests/test_parser.py

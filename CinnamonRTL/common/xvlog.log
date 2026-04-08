@@ -1,0 +1,14 @@
+INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/CONNECT/xmeng027/work/Cinnamon/CinnamonRTL/common/test_util.sv" into library work
+INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/CONNECT/xmeng027/work/Cinnamon/CinnamonRTL/common/math.sv" into library work
+INFO: [VRFC 10-2263] Analyzing SystemVerilog file "/home/CONNECT/xmeng027/work/Cinnamon/CinnamonRTL/common/rect_mem.sv" into library work
+INFO: [VRFC 10-311] analyzing module RectMem
+ERROR: [VRFC 10-1103] net type must be explicitly specified for 'clock' when default_nettype is none [/home/CONNECT/xmeng027/work/Cinnamon/CinnamonRTL/common/rect_mem.sv:17]
+ERROR: [VRFC 10-1103] net type must be explicitly specified for 'io_readAddr' when default_nettype is none [/home/CONNECT/xmeng027/work/Cinnamon/CinnamonRTL/common/rect_mem.sv:18]
+ERROR: [VRFC 10-1103] net type must be explicitly specified for 'io_writeAddr' when default_nettype is none [/home/CONNECT/xmeng027/work/Cinnamon/CinnamonRTL/common/rect_mem.sv:20]
+ERROR: [VRFC 10-1103] net type must be explicitly specified for 'io_writeData' when default_nettype is none [/home/CONNECT/xmeng027/work/Cinnamon/CinnamonRTL/common/rect_mem.sv:21]
+ERROR: [VRFC 10-1103] net type must be explicitly specified for 'io_writeEnable' when default_nettype is none [/home/CONNECT/xmeng027/work/Cinnamon/CinnamonRTL/common/rect_mem.sv:22]
+ERROR: [VRFC 10-8530] module 'RectMem' is ignored due to previous errors [/home/CONNECT/xmeng027/work/Cinnamon/CinnamonRTL/common/rect_mem.sv:9]
+INFO: [VRFC 10-311] analyzing module PrimeModMem
+ERROR: [VRFC 10-1103] net type must be explicitly specified for 'clock' when default_nettype is none [/home/CONNECT/xmeng027/work/Cinnamon/CinnamonRTL/common/rect_mem.sv:58]
+ERROR: [VRFC 10-1103] net type must be explicitly specified for 'io_primeId' when default_nettype is none [/home/CONNECT/xmeng027/work/Cinnamon/CinnamonRTL/common/rect_mem.sv:59]
+ERROR: [VRFC 10-8530] module 'PrimeModMem' is ignored due to previous errors [/home/CONNECT/xmeng027/work/Cinnamon/CinnamonRTL/common/rect_mem.sv:50]

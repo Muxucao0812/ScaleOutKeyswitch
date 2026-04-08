@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: cinnamon-fpga
+Version: 0.1.0
+Summary: Python FPGA runtime for Cinnamon compiler outputs
+Requires-Python: >=3.10

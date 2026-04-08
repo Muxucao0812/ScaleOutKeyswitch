@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cinnamon-fpga"
+version = "0.1.0"
+description = "Python FPGA runtime for Cinnamon compiler outputs"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cinnamon_fpga*"]

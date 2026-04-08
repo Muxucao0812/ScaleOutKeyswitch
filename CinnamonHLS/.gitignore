@@ -1,0 +1,16 @@
+v++_*.log
+*.backup.log
+vitis_hls.log
+xcd.log
+
+.kernel_validation_prj_*/
+.auto_transpose_prj_*/
+.ipcache/
+.run/
+.Xil/
+prj_mem_dbg7/
+
+build/hls_tmp/
+build/**/_tmp_compile_*/
+build/**/_tmp_link/
+build/logs/kernel_validation/
