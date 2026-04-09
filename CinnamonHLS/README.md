@@ -7,11 +7,16 @@ This directory contains the RTL-to-HLS migration baseline and FPGA runtime for C
 - HLS-compatible C++ models for RTL modules:
   - `arithmetic_modular` (add/sub/mul/barrett)
   - `montgomery` (NTT-friendly reduction/multiplication)
-  - `ntt` (`ntt_unit`, `ntt_four_stage`)
+  - `ntt` (CKKS negacyclic four-step path with pre/post twist and explicit transpose)
   - `base_conv` (`change_rns_base`, `rns_resolve`)
   - `automorphism`
   - `transpose`
   - `memory_models` (`RectMem`, `Regfile` behavior)
+- Generated negacyclic NTT root tables:
+  - generator: `CinnamonHLS/scripts/generate_ntt_tables.py`
+  - generated assets:
+    - `CinnamonHLS/kernels/generated_ntt_tables.hpp`
+    - `CinnamonHLS/python/cinnamon_fpga/generated_ntt_tables.py`
 - Unit tests that mirror existing RTL test vectors.
 - Multi-kernel Vitis xclbin:
   - `cinnamon_memory`
@@ -59,6 +64,19 @@ Platform default: `xilinx_u55c_gen3x16_xdma_3_202210_1`
 Link step默认会加载 `CinnamonHLS/config/hbm_memory_connectivity.cfg`，将
 `cinnamon_memory_1` 的 `instructions/inputs/outputs` 端口绑定到独立 HBM bank。
 如需切换配置，可在构建前设置 `CONNECTIVITY_CFG=/path/to/your.cfg`。
+
+可选构建控制（便于硬件拥塞调参）：
+
+```bash
+# 仅编译 xo（不执行 link）
+BUILD_STAGE=compile COMPILE_FREQUENCY_MHZ=160 CinnamonHLS/scripts/build_xclbin.sh hw
+
+# 仅执行 link（复用已编译 xo）
+BUILD_STAGE=link LINK_FREQUENCY_MHZ=160 CinnamonHLS/scripts/build_xclbin.sh hw
+
+# 追加额外 link 配置（例如 vivado 实现策略）
+EXTRA_LINK_CFG=CinnamonHLS/config/hw_impl_high_effort.cfg CinnamonHLS/scripts/build_xclbin.sh hw
+```
 
 ## Cleanup Generated Artifacts
 

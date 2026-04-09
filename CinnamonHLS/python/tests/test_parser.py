@@ -169,3 +169,21 @@ def test_expected_module_output_words_shape() -> None:
     assert outputs[3] == 2
     assert outputs[4] == 2
     assert outputs[6:] == [11, 18, 13, 14]
+
+
+def test_expected_module_output_words_rot_negative_uses_absolute_rotation() -> None:
+    ins = encode_instruction_descriptor("rot -8 r60: r20 | 63")
+    state = [1000 + i for i in range(64)]
+    outputs = expected_module_output_words(
+        module_name="automorphism",
+        instruction_words=ins,
+        input_words=state,
+        output_count=80,
+        partition_id=0,
+    )
+
+    assert outputs[1] == 1
+    assert outputs[2] == 64
+    # src=20, rot=-8 => abs(rot)=8 so mapped index is 28.
+    assert outputs[6 + 60] == state[28]
+    assert outputs[6 + 60] != state[12]

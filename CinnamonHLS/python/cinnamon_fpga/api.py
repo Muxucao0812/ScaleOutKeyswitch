@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import json
 import os
 import pathlib
 import re
@@ -42,6 +43,53 @@ _MODULE_IDS = {
 _PROGRAM_INPUT_ENTRY_RE = re.compile(
     r"^\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*\[([^\]]*)\]\s*$"
 )
+_JSONL_ENV = "CINNAMON_FPGA_JSONL_LOG"
+_JSONL_DEBUG_ENV = "CINNAMON_FPGA_JSONL_DEBUG_LOG"
+_JSONL_DEBUG_FLAG_ENV = "CINNAMON_FPGA_JSONL_DEBUG"
+_DEBUG_PREVIEW_WORDS = 8
+
+
+def _env_flag(name: str) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _append_jsonl(path: str, payload: Dict[str, Any]) -> None:
+    target = pathlib.Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(payload, sort_keys=True, default=str) + "\n"
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def _emit_jsonl(
+    event: str,
+    *,
+    payload: Dict[str, Any],
+    debug_payload: Dict[str, Any] | None = None,
+) -> None:
+    always_path = os.getenv(_JSONL_ENV, "").strip()
+    debug_enabled = _env_flag(_JSONL_DEBUG_FLAG_ENV)
+    debug_path = os.getenv(_JSONL_DEBUG_ENV, "").strip() or always_path
+    if not always_path and not (debug_enabled and debug_path):
+        return
+
+    base_payload = {
+        "event": event,
+        "ts_unix_s": time.time(),
+        **payload,
+    }
+    if always_path:
+        _append_jsonl(always_path, base_payload)
+    if debug_enabled and debug_path:
+        debug_entry = dict(base_payload)
+        if debug_payload:
+            debug_entry.update(debug_payload)
+        debug_entry["debug"] = True
+        _append_jsonl(debug_path, debug_entry)
 
 
 def _maybe_import_emulator():
@@ -430,26 +478,48 @@ class Emulator:
                     *io_tail,
                 ]
 
-                partition_records[partition_id]["module_results"].append(
-                    {
-                        "module": module_name,
-                        "kernel_name": kernel_name,
+                module_result = {
+                    "module": module_name,
+                    "kernel_name": kernel_name,
+                    "opcode_counts": dict(bucket.opcode_counts),
+                    "status": int(dispatch.output_words[0]) if len(dispatch.output_words) > 0 else None,
+                    "executed": int(dispatch.output_words[1]) if len(dispatch.output_words) > 1 else None,
+                    "register_count": int(dispatch.output_words[2]) if len(dispatch.output_words) > 2 else None,
+                    "module_id": int(dispatch.output_words[3]) if len(dispatch.output_words) > 3 else None,
+                    "partition_id": int(dispatch.output_words[4]) if len(dispatch.output_words) > 4 else None,
+                    "trace_acc": int(dispatch.output_words[5]) if len(dispatch.output_words) > 5 else None,
+                    "timing": {
+                        "setup_s": float(dispatch.setup_s),
+                        "h2d_s": float(dispatch.h2d_s),
+                        "wait_s": float(dispatch.wait_s),
+                        "d2h_s": float(dispatch.d2h_s),
+                        "partition_total_s": float(dispatch.total_s),
+                    },
+                    "output_words": list(dispatch.output_words),
+                }
+                partition_records[partition_id]["module_results"].append(module_result)
+                _emit_jsonl(
+                    "api.module_results_append",
+                    payload={
+                        "card_id": int(dispatch.board_index),
+                        "partition_id": int(partition_id),
+                        "module": str(module_name),
+                        "kernel_name": str(kernel_name),
+                        "kernel_status": module_result.get("status"),
+                        "kernel_executed": module_result.get("executed"),
+                        "kernel_register_count": module_result.get("register_count"),
+                        "kernel_module_id": module_result.get("module_id"),
+                        "kernel_partition_id": module_result.get("partition_id"),
+                        "kernel_trace_acc": module_result.get("trace_acc"),
+                        "instruction_count": int(len(bucket.instruction_words)),
+                    },
+                    debug_payload={
                         "opcode_counts": dict(bucket.opcode_counts),
-                        "status": int(dispatch.output_words[0]) if len(dispatch.output_words) > 0 else None,
-                        "executed": int(dispatch.output_words[1]) if len(dispatch.output_words) > 1 else None,
-                        "register_count": int(dispatch.output_words[2]) if len(dispatch.output_words) > 2 else None,
-                        "module_id": int(dispatch.output_words[3]) if len(dispatch.output_words) > 3 else None,
-                        "partition_id": int(dispatch.output_words[4]) if len(dispatch.output_words) > 4 else None,
-                        "trace_acc": int(dispatch.output_words[5]) if len(dispatch.output_words) > 5 else None,
-                        "timing": {
-                            "setup_s": float(dispatch.setup_s),
-                            "h2d_s": float(dispatch.h2d_s),
-                            "wait_s": float(dispatch.wait_s),
-                            "d2h_s": float(dispatch.d2h_s),
-                            "partition_total_s": float(dispatch.total_s),
-                        },
-                        "output_words": list(dispatch.output_words),
-                    }
+                        "raw_output_preview": [
+                            int(word)
+                            for word in module_result.get("output_words", [])[:_DEBUG_PREVIEW_WORDS]
+                        ],
+                    },
                 )
 
         run_end_s = time.perf_counter()

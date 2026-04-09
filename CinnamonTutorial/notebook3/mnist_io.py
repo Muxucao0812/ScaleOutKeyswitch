@@ -1,4 +1,8 @@
 import pickle
+import json
+import os
+import pathlib
+import time
 
 Primes = [204865537, 205651969, 206307329, 207880193, 209059841, 210370561, 211025921, 211812353, 214171649, 215482369, 215744513, 216137729, 216924161, 217317377, 218628097, 219676673, 220594177, 221249537, 222035969, 222167041, 222953473, 223215617, 224002049, 224133121, 225574913, 228065281, 228458497, 228720641, 230424577, 230686721, 230817793, 231473153, 232390657, 232652801, 234356737, 235798529, 236584961, 236716033, 239337473, 239861761, 240648193, 241827841, 244842497, 244973569, 245235713, 245760001, 246415361, 249561089, 253100033, 253493249, 254279681, 256376833, 256770049, 257949697, 258605057, 260571137, 260702209, 261488641, 261881857, 263323649, 263454721, 264634369, 265420801, 268042241]
 class ValueMeta:
@@ -40,8 +44,51 @@ ReferenceOutputs = {}
 import numpy as np
 SLOTS = 32*1024
 
+_JSONL_ENV = "CINNAMON_FPGA_JSONL_LOG"
+_JSONL_DEBUG_ENV = "CINNAMON_FPGA_JSONL_DEBUG_LOG"
+_JSONL_DEBUG_FLAG_ENV = "CINNAMON_FPGA_JSONL_DEBUG"
+_DEBUG_PREVIEW_WORDS = 8
+
+
+def _env_flag(name):
+    value = os.getenv(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _append_jsonl(path, payload):
+    target = pathlib.Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(payload, sort_keys=True, default=str) + "\n"
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def _emit_jsonl(event, payload, debug_payload=None):
+    always_path = os.getenv(_JSONL_ENV, "").strip()
+    debug_enabled = _env_flag(_JSONL_DEBUG_FLAG_ENV)
+    debug_path = os.getenv(_JSONL_DEBUG_ENV, "").strip() or always_path
+    if not always_path and not (debug_enabled and debug_path):
+        return
+
+    base_payload = {
+        "event": event,
+        "ts_unix_s": time.time(),
+        **payload,
+    }
+    if always_path:
+        _append_jsonl(always_path, base_payload)
+    if debug_enabled and debug_path:
+        debug_entry = dict(base_payload)
+        if debug_payload is not None:
+            debug_entry.update(debug_payload)
+        debug_entry["debug"] = True
+        _append_jsonl(debug_path, debug_entry)
+
 def rotate(x,n):
-    return np.concat((x[n:],x[:n]))
+    return np.concatenate((x[n:], x[:n]))
 
 def pack_image(input_image,kernel_weights,stride):
     input_height, input_width = input_image.shape
@@ -65,7 +112,26 @@ def pack_image(input_image,kernel_weights,stride):
                 continue
             idx = 128 * (i * 64 + j)
             im2col_packed[(idx % SLOTS) + (idx//SLOTS) * 8] = im2col[j,(i+j) % 64]
-    
+
+    _emit_jsonl(
+        "mnist_io.pack_image",
+        payload={
+            "sample_id": None,
+            "decode_mode": "im2col_pack",
+            "index_map": {
+                "stride": int(stride),
+                "slot_stride": 128,
+                "tile_side": 64,
+            },
+            "input_shape": [int(input_height), int(input_width)],
+            "kernel_shape": [int(out_channels), int(kernel_height), int(kernel_width)],
+        },
+        debug_payload={
+            "raw_input_preview": [float(v) for v in input_image.reshape(-1)[:_DEBUG_PREVIEW_WORDS]],
+            "raw_packed_preview": [float(v) for v in im2col_packed[:_DEBUG_PREVIEW_WORDS]],
+        },
+    )
+
     return im2col_packed
 
 
@@ -86,7 +152,7 @@ def conv2d_io(imageMeta,kernel_weights,kernel_bias):
 
     sum = np.zeros((out_channels,SLOTS))
     for o in range(out_channels):   
-        w64 = np.concat((kernel_weights[o].reshape(-1,1).flatten(), np.zeros(64-49)))
+        w64 = np.concatenate((kernel_weights[o].reshape(-1, 1).flatten(), np.zeros(64 - 49)))
         for i in range(64):
             weights_packed[o,i,0:8192][0::128] = rotate(w64,i)
         kernel_bias_packed[o,0:8192][0::128] = kernel_bias[o]
@@ -221,6 +287,21 @@ def get_mnist_program_io(input_image, level):
     ModelInputs.update(o3I)
     ModelOutScales.update(o3O)
     ModelOutScales["pred"] = o3Meta.scale
+    _emit_jsonl(
+        "mnist_io.pred_scale_source",
+        payload={
+            "sample_id": None,
+            "scale": float(o3Meta.scale),
+            "decode_mode": "pred_scale_source",
+            "index_map": {"source": "o3Meta.scale", "level": int(o3Meta.level)},
+            "plain_pred": None,
+            "cpu_ref_pred": None,
+            "label": None,
+        },
+        debug_payload={
+            "raw_preview": [float(v) for v in f2b.reshape(-1)[:_DEBUG_PREVIEW_WORDS]],
+        },
+    )
 
 
     Inputs.update(ModelInputs)

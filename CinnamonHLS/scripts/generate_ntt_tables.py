@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import pathlib
+from typing import Dict, List, Sequence
+
+# Tutorial3 CKKS primes (CinnamonTutorial/notebook3/mnist_io.py) plus legacy NTT
+# unit-test moduli still used by CinnamonHLS tests.
+_KNOWN_MODULI: Sequence[int] = (
+    786433,
+    1179649,
+    2752513,
+    5767169,
+    6946817,
+    204865537,
+    205651969,
+    206307329,
+    207880193,
+    209059841,
+    210370561,
+    211025921,
+    211812353,
+    214171649,
+    215482369,
+    215744513,
+    216137729,
+    216924161,
+    217317377,
+    218628097,
+    219676673,
+    220594177,
+    221249537,
+    222035969,
+    222167041,
+    222953473,
+    223215617,
+    224002049,
+    224133121,
+    225574913,
+    228065281,
+    228458497,
+    228720641,
+    230424577,
+    230686721,
+    230817793,
+    231473153,
+    232390657,
+    232652801,
+    234356737,
+    235798529,
+    236584961,
+    236716033,
+    239337473,
+    239861761,
+    240648193,
+    241827841,
+    244842497,
+    244973569,
+    245235713,
+    245760001,
+    246415361,
+    249561089,
+    253100033,
+    253493249,
+    254279681,
+    256376833,
+    256770049,
+    257949697,
+    258605057,
+    260571137,
+    260702209,
+    261488641,
+    261881857,
+    263323649,
+    263454721,
+    264634369,
+    265420801,
+    268042241,
+)
+
+_SUPPORTED_SPANS: Sequence[int] = (2, 4, 8, 16, 32, 64)
+
+
+def _prime_factors(n: int) -> List[int]:
+    factors: List[int] = []
+    d = 2
+    value = n
+    while d * d <= value:
+        if value % d == 0:
+            factors.append(d)
+            while value % d == 0:
+                value //= d
+        d += 1 if d == 2 else 2
+    if value > 1:
+        factors.append(value)
+    return factors
+
+
+def _extended_gcd(a: int, b: int) -> tuple[int, int, int]:
+    if b == 0:
+        return (a, 1, 0)
+    g, x1, y1 = _extended_gcd(b, a % b)
+    return (g, y1, x1 - (a // b) * y1)
+
+
+def _mod_inv(a: int, mod: int) -> int:
+    g, x, _ = _extended_gcd(a % mod, mod)
+    if g != 1:
+        return 0
+    return x % mod
+
+
+def _primitive_root(mod: int) -> int:
+    phi = mod - 1
+    factors = _prime_factors(phi)
+    for g in range(2, mod):
+        ok = True
+        for p in factors:
+            if pow(g, phi // p, mod) == 1:
+                ok = False
+                break
+        if ok:
+            return g
+    raise ValueError(f"failed to find primitive root for modulus {mod}")
+
+
+def _build_entries() -> List[Dict[str, int]]:
+    entries: List[Dict[str, int]] = []
+    for mod in sorted(set(int(v) for v in _KNOWN_MODULI)):
+        phi = mod - 1
+        generator = _primitive_root(mod)
+        for span in _SUPPORTED_SPANS:
+            if phi % (2 * span) != 0:
+                continue
+            psi = pow(generator, phi // (2 * span), mod)
+            if pow(psi, span, mod) != (mod - 1):
+                continue
+            psi_inv = _mod_inv(psi, mod)
+            omega = (psi * psi) % mod
+            omega_inv = _mod_inv(omega, mod)
+            if psi_inv == 0 or omega_inv == 0:
+                continue
+            entries.append(
+                {
+                    "mod": mod,
+                    "span": span,
+                    "psi": psi,
+                    "psi_inv": psi_inv,
+                    "omega": omega,
+                    "omega_inv": omega_inv,
+                }
+            )
+    return entries
+
+
+def _render_cpp(entries: Sequence[Dict[str, int]]) -> str:
+    lines: List[str] = []
+    lines.append("#pragma once")
+    lines.append("")
+    lines.append("#include <cstddef>")
+    lines.append("#include <cstdint>")
+    lines.append("")
+    lines.append("namespace cinnamon_hls_kernel {")
+    lines.append("")
+    lines.append("struct NegacyclicRootTableEntry {")
+    lines.append("  std::uint64_t mod;")
+    lines.append("  std::uint32_t span;")
+    lines.append("  std::uint64_t psi;")
+    lines.append("  std::uint64_t psi_inv;")
+    lines.append("  std::uint64_t omega;")
+    lines.append("  std::uint64_t omega_inv;")
+    lines.append("};")
+    lines.append("")
+    lines.append("static constexpr NegacyclicRootTableEntry kNegacyclicRootTable[] = {")
+    for entry in entries:
+        lines.append(
+            "    {"
+            f"{entry['mod']}ULL, {entry['span']}U, {entry['psi']}ULL, "
+            f"{entry['psi_inv']}ULL, {entry['omega']}ULL, {entry['omega_inv']}ULL"
+            "},"
+        )
+    lines.append("};")
+    lines.append("")
+    lines.append("constexpr std::size_t kNegacyclicRootTableSize =")
+    lines.append(
+        "    sizeof(kNegacyclicRootTable) / sizeof(kNegacyclicRootTable[0]);"
+    )
+    lines.append("")
+    lines.append("}  // namespace cinnamon_hls_kernel")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_python(entries: Sequence[Dict[str, int]]) -> str:
+    lines: List[str] = []
+    lines.append("from __future__ import annotations")
+    lines.append("")
+    lines.append("# Auto-generated by scripts/generate_ntt_tables.py")
+    lines.append("NEGACYCLIC_ROOT_TABLE = {")
+    for entry in entries:
+        key = (entry["mod"], entry["span"])
+        lines.append(
+            f"    {key}: "
+            "{"
+            f"'psi': {entry['psi']}, "
+            f"'psi_inv': {entry['psi_inv']}, "
+            f"'omega': {entry['omega']}, "
+            f"'omega_inv': {entry['omega_inv']}"
+            "},"
+        )
+    lines.append("}")
+    lines.append("")
+    moduli = sorted({entry["mod"] for entry in entries})
+    spans = sorted({entry["span"] for entry in entries})
+    lines.append(f"SUPPORTED_MODULI = {tuple(moduli)}")
+    lines.append(f"SUPPORTED_SPANS = {tuple(spans)}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    script_dir = pathlib.Path(__file__).resolve().parent
+    root_dir = script_dir.parent
+    parser = argparse.ArgumentParser(
+        description="Generate CKKS negacyclic NTT psi/twiddle tables for HLS and Python models."
+    )
+    parser.add_argument(
+        "--cpp-out",
+        type=pathlib.Path,
+        default=root_dir / "kernels" / "generated_ntt_tables.hpp",
+    )
+    parser.add_argument(
+        "--py-out",
+        type=pathlib.Path,
+        default=root_dir / "python" / "cinnamon_fpga" / "generated_ntt_tables.py",
+    )
+    args = parser.parse_args()
+
+    entries = _build_entries()
+    if not entries:
+        raise RuntimeError("no negacyclic roots generated")
+
+    args.cpp_out.parent.mkdir(parents=True, exist_ok=True)
+    args.py_out.parent.mkdir(parents=True, exist_ok=True)
+    args.cpp_out.write_text(_render_cpp(entries), encoding="utf-8")
+    args.py_out.write_text(_render_python(entries), encoding="utf-8")
+    print(
+        f"Generated {len(entries)} entries -> {args.cpp_out} and {args.py_out}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

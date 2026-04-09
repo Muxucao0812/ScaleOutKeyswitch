@@ -69,11 +69,7 @@ inline void execute_ntt_module(const std::uint64_t *instructions,
     }
 
     const bool inverse = (inst.opcode == kOpInt);
-    if (inverse) {
-      ntt_apply_dif(block, span, mod, inst.rns, true);
-    } else {
-      ntt_apply_dit(block, span, mod, inst.rns, false);
-    }
+    ntt_apply_negacyclic_four_step(block, span, mod, inst.rns, inverse);
 
     for (std::uint32_t j = 0U; j < span; ++j) {
 #pragma HLS PIPELINE II = 1

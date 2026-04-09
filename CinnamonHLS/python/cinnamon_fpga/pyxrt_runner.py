@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import pathlib
 import struct
@@ -67,6 +68,53 @@ _KERNEL_CACHE_LOCK = threading.Lock()
 _DEVICE_CACHE: Dict[Tuple[int, str], _DeviceHandle] = {}
 _KERNEL_CACHE: Dict[Tuple[int, str, str], _KernelHandle] = {}
 _BO_CACHE: Dict[Tuple[int, str, str, int], _BoBundle] = {}
+_JSONL_ENV = "CINNAMON_FPGA_JSONL_LOG"
+_JSONL_DEBUG_ENV = "CINNAMON_FPGA_JSONL_DEBUG_LOG"
+_JSONL_DEBUG_FLAG_ENV = "CINNAMON_FPGA_JSONL_DEBUG"
+_DEBUG_PREVIEW_WORDS = 8
+
+
+def _env_flag(name: str) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _append_jsonl(path: str, payload: Dict[str, Any]) -> None:
+    target = pathlib.Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(payload, sort_keys=True, default=str) + "\n"
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def _emit_jsonl(
+    event: str,
+    *,
+    payload: Dict[str, Any],
+    debug_payload: Dict[str, Any] | None = None,
+) -> None:
+    always_path = os.getenv(_JSONL_ENV, "").strip()
+    debug_enabled = _env_flag(_JSONL_DEBUG_FLAG_ENV)
+    debug_path = os.getenv(_JSONL_DEBUG_ENV, "").strip() or always_path
+    if not always_path and not (debug_enabled and debug_path):
+        return
+
+    base_payload = {
+        "event": event,
+        "ts_unix_s": time.time(),
+        **payload,
+    }
+    if always_path:
+        _append_jsonl(always_path, base_payload)
+    if debug_enabled and debug_path:
+        debug_entry = dict(base_payload)
+        if debug_payload:
+            debug_entry.update(debug_payload)
+        debug_entry["debug"] = True
+        _append_jsonl(debug_path, debug_entry)
 
 def _load_pyxrt():
     try:
@@ -283,6 +331,36 @@ def run_partition_dispatch(
     output_raw = bytes(mapped[:outputs_packed_size])
     output_words = _unpack_words(output_raw)[:output_words_count]
     t_done = time.perf_counter()
+
+    _emit_jsonl(
+        "pyxrt.run_partition_dispatch",
+        payload={
+            "card_id": int(board_index),
+            "partition_id": int(partition_id),
+            "kernel_name": str(config.kernel_name),
+            "instruction_count": int(len(instruction_words)),
+            "input_count": int(len(input_words)),
+            "output_count": int(output_words_count),
+            "kernel_status": int(output_words[0]) if len(output_words) > 0 else None,
+            "kernel_executed": int(output_words[1]) if len(output_words) > 1 else None,
+            "kernel_register_count": int(output_words[2]) if len(output_words) > 2 else None,
+            "kernel_module_id": int(output_words[3]) if len(output_words) > 3 else None,
+            "kernel_partition_id": int(output_words[4]) if len(output_words) > 4 else None,
+            "kernel_trace_acc": int(output_words[5]) if len(output_words) > 5 else None,
+            "setup_s": float(t_setup_done - t_begin),
+            "h2d_s": float(t_h2d_done - t_setup_done),
+            "wait_s": float(t_wait_done - t_wait_begin),
+            "d2h_s": float(t_done - t_wait_done),
+            "partition_total_s": float(t_done - t_begin),
+        },
+        debug_payload={
+            "raw_instruction_preview": [
+                int(word) for word in instruction_words[:_DEBUG_PREVIEW_WORDS]
+            ],
+            "raw_input_preview": [int(word) for word in input_words[:_DEBUG_PREVIEW_WORDS]],
+            "raw_output_preview": [int(word) for word in output_words[:_DEBUG_PREVIEW_WORDS]],
+        },
+    )
 
     return PartitionDispatchResult(
         kernel_name=config.kernel_name,

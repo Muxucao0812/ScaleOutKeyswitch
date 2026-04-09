@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "generated_ntt_tables.hpp"
+
 namespace cinnamon_hls_kernel {
 
 constexpr std::uint32_t kInstructionWordStride = 4U;
@@ -105,6 +107,24 @@ inline std::uint64_t mod_mul(std::uint64_t a, std::uint64_t b,
   const __uint128_t p = static_cast<__uint128_t>(a % mod) *
                         static_cast<__uint128_t>(b % mod);
   return static_cast<std::uint64_t>(p % mod);
+}
+
+inline std::uint64_t mod_pow(std::uint64_t base, std::uint64_t exponent,
+                             std::uint64_t mod) {
+  if (mod == 0U) {
+    return 0U;
+  }
+  std::uint64_t acc = 1U;
+  std::uint64_t b = base % mod;
+  std::uint64_t e = exponent;
+  while (e != 0U) {
+    if ((e & 1U) != 0U) {
+      acc = mod_mul(acc, b, mod);
+    }
+    b = mod_mul(b, b, mod);
+    e >>= 1U;
+  }
+  return acc;
 }
 
 inline std::uint64_t mod_inv(std::uint64_t a, std::uint64_t mod) {
@@ -439,36 +459,196 @@ inline std::uint64_t lookup_ntt_twiddle(std::uint64_t mod,
                (mod - 1U));
 }
 
+struct NegacyclicRoots {
+  std::uint64_t psi = 1U;
+  std::uint64_t psi_inv = 1U;
+  std::uint64_t omega = 1U;
+  std::uint64_t omega_inv = 1U;
+  bool from_table = false;
+};
+
+inline NegacyclicRoots resolve_negacyclic_roots(std::uint64_t mod,
+                                                std::uint32_t span,
+                                                std::uint32_t prime_id) {
+  NegacyclicRoots roots{};
+  for (std::size_t i = 0; i < kNegacyclicRootTableSize; ++i) {
+#pragma HLS PIPELINE II = 1
+    const auto &entry = kNegacyclicRootTable[i];
+    if (entry.mod == mod && entry.span == span) {
+      roots.psi = entry.psi % mod;
+      roots.psi_inv = entry.psi_inv % mod;
+      roots.omega = entry.omega % mod;
+      roots.omega_inv = entry.omega_inv % mod;
+      roots.from_table = true;
+      return roots;
+    }
+  }
+  // Compatibility fallback for unexpected modulus/span pairs.
+  const std::uint64_t fallback_omega =
+      lookup_ntt_twiddle(mod, prime_id, false, 1U, span);
+  roots.omega = (mod == 0U) ? 1U : (fallback_omega % mod);
+  roots.omega_inv = mod_inv(roots.omega, mod);
+  if (roots.omega_inv == 0U) {
+    roots.omega_inv = 1U;
+  }
+  return roots;
+}
+
+inline void choose_four_step_shape(std::uint32_t span,
+                                   std::uint32_t &rows,
+                                   std::uint32_t &cols) {
+  const std::uint32_t levels = static_cast<std::uint32_t>(__builtin_ctz(span));
+  const std::uint32_t row_levels = levels >> 1U;
+  rows = 1U << row_levels;
+  cols = 1U << (levels - row_levels);
+}
+
+inline void small_cyclic_dft(const std::uint64_t *input,
+                             std::uint64_t *output,
+                             std::uint32_t length,
+                             std::uint64_t root,
+                             std::uint64_t mod) {
+  if (length == 0U) {
+    return;
+  }
+  for (std::uint32_t k = 0U; k < length; ++k) {
+#pragma HLS PIPELINE II = 1
+    const std::uint64_t step = mod_pow(root, k, mod);
+    std::uint64_t tw = 1U;
+    std::uint64_t acc = 0U;
+    for (std::uint32_t n = 0U; n < length; ++n) {
+      acc = mod_add(acc, mod_mul(input[n], tw, mod), mod);
+      tw = mod_mul(tw, step, mod);
+    }
+    output[k] = acc;
+  }
+}
+
+inline void cyclic_ntt_four_step(std::uint64_t *values,
+                                 std::uint32_t span,
+                                 std::uint64_t omega,
+                                 std::uint64_t mod,
+                                 bool inverse_cyclic) {
+  constexpr std::uint32_t kMaxSpan = 64U;
+  constexpr std::uint32_t kMaxFourStepSide = 8U;
+  if (span < 2U || span > kMaxSpan || mod == 0U) {
+    return;
+  }
+
+  std::uint32_t rows = 1U;
+  std::uint32_t cols = span;
+  choose_four_step_shape(span, rows, cols);
+  if (rows * cols != span || rows > kMaxFourStepSide || cols > kMaxFourStepSide) {
+    return;
+  }
+
+  std::uint64_t stage1[kMaxSpan];
+  std::uint64_t stage2[kMaxSpan];
+  std::uint64_t lane_in[kMaxFourStepSide];
+  std::uint64_t lane_out[kMaxFourStepSide];
+#pragma HLS ARRAY_PARTITION variable = stage1 cyclic factor = 8
+#pragma HLS ARRAY_PARTITION variable = stage2 cyclic factor = 8
+#pragma HLS ARRAY_PARTITION variable = lane_in complete
+#pragma HLS ARRAY_PARTITION variable = lane_out complete
+
+  const std::uint64_t row_root = mod_pow(omega, rows, mod);
+  const std::uint64_t col_root = mod_pow(omega, cols, mod);
+
+  // Stage 1: C-point transforms over n2 with x[n1 + R*n2] mapping.
+  for (std::uint32_t n1 = 0U; n1 < rows; ++n1) {
+    for (std::uint32_t n2 = 0U; n2 < cols; ++n2) {
+#pragma HLS PIPELINE II = 1
+      lane_in[n2] = values[n1 + rows * n2] % mod;
+    }
+    small_cyclic_dft(lane_in, lane_out, cols, row_root, mod);
+    for (std::uint32_t k2 = 0U; k2 < cols; ++k2) {
+#pragma HLS PIPELINE II = 1
+      stage1[n1 * cols + k2] = lane_out[k2];
+    }
+  }
+
+  // Stage 2: middle twiddle multiply.
+  for (std::uint32_t n1 = 0U; n1 < rows; ++n1) {
+    std::uint64_t tw = 1U;
+    const std::uint64_t step = mod_pow(omega, n1, mod);
+    for (std::uint32_t k2 = 0U; k2 < cols; ++k2) {
+#pragma HLS PIPELINE II = 1
+      const std::uint32_t idx = n1 * cols + k2;
+      stage1[idx] = mod_mul(stage1[idx], tw, mod);
+      tw = mod_mul(tw, step, mod);
+    }
+  }
+
+  // Stage 3: explicit transpose to C x R.
+  for (std::uint32_t n1 = 0U; n1 < rows; ++n1) {
+    for (std::uint32_t k2 = 0U; k2 < cols; ++k2) {
+#pragma HLS PIPELINE II = 1
+      stage2[k2 * rows + n1] = stage1[n1 * cols + k2];
+    }
+  }
+
+  // Stage 4: R-point transforms over n1, write k = k2 + C*k1.
+  for (std::uint32_t k2 = 0U; k2 < cols; ++k2) {
+    for (std::uint32_t n1 = 0U; n1 < rows; ++n1) {
+#pragma HLS PIPELINE II = 1
+      lane_in[n1] = stage2[k2 * rows + n1];
+    }
+    small_cyclic_dft(lane_in, lane_out, rows, col_root, mod);
+    for (std::uint32_t k1 = 0U; k1 < rows; ++k1) {
+#pragma HLS PIPELINE II = 1
+      values[k2 + cols * k1] = lane_out[k1];
+    }
+  }
+
+  if (inverse_cyclic) {
+    const std::uint64_t span_inv = mod_inv(span, mod);
+    if (span_inv != 0U) {
+      for (std::uint32_t i = 0U; i < span; ++i) {
+#pragma HLS PIPELINE II = 1
+        values[i] = mod_mul(values[i], span_inv, mod);
+      }
+    }
+  }
+}
+
+inline void ntt_apply_negacyclic_four_step(std::uint64_t *values,
+                                           std::uint32_t span,
+                                           std::uint64_t mod,
+                                           std::uint32_t prime_id,
+                                           bool inverse) {
+  if (span < 2U || mod == 0U || !is_power_of_two(span)) {
+    return;
+  }
+  const NegacyclicRoots roots = resolve_negacyclic_roots(mod, span, prime_id);
+
+  if (!inverse) {
+    // Pre-twist by psi^i before cyclic NTT(omega = psi^2).
+    std::uint64_t twist = 1U;
+    for (std::uint32_t i = 0U; i < span; ++i) {
+#pragma HLS PIPELINE II = 1
+      values[i] = mod_mul(values[i] % mod, twist, mod);
+      twist = mod_mul(twist, roots.psi, mod);
+    }
+    cyclic_ntt_four_step(values, span, roots.omega, mod, false);
+    return;
+  }
+
+  // Inverse cyclic NTT first, then post-twist by psi^-i.
+  cyclic_ntt_four_step(values, span, roots.omega_inv, mod, true);
+  std::uint64_t twist = 1U;
+  for (std::uint32_t i = 0U; i < span; ++i) {
+#pragma HLS PIPELINE II = 1
+    values[i] = mod_mul(values[i] % mod, twist, mod);
+    twist = mod_mul(twist, roots.psi_inv, mod);
+  }
+}
+
 inline void ntt_apply_dit(std::uint64_t *values,
                           std::uint32_t span,
                           std::uint64_t mod,
                           std::uint32_t prime_id,
                           bool inverse) {
-  if (span < 2U || mod == 0U) {
-    return;
-  }
-  const std::uint32_t levels = static_cast<std::uint32_t>(__builtin_ctz(span));
-  for (std::uint32_t level = 0U; level < levels; ++level) {
-    const std::uint32_t half_block = 1U << level;
-    const std::uint32_t block_size = half_block << 1U;
-    const std::uint32_t block_num = span / block_size;
-    for (std::uint32_t block_id = 0U; block_id < block_num; ++block_id) {
-      for (std::uint32_t i = 0U; i < half_block; ++i) {
-#pragma HLS PIPELINE II = 1
-        const std::uint32_t idx1 = block_id * block_size + i;
-        const std::uint32_t idx2 = idx1 + half_block;
-        const std::uint32_t exponent =
-            inverse ? ((2U * i) * block_num) : (((2U * i) + 1U) * block_num);
-        const std::uint64_t tw =
-            lookup_ntt_twiddle(mod, prime_id, inverse, exponent, span);
-        const std::uint64_t a = values[idx1] % mod;
-        const std::uint64_t b = values[idx2] % mod;
-        const std::uint64_t t = mod_mul(b, tw, mod);
-        values[idx1] = mod_add(a, t, mod);
-        values[idx2] = mod_sub(a, t, mod);
-      }
-    }
-  }
+  ntt_apply_negacyclic_four_step(values, span, mod, prime_id, inverse);
 }
 
 inline void ntt_apply_dif(std::uint64_t *values,
@@ -476,33 +656,7 @@ inline void ntt_apply_dif(std::uint64_t *values,
                           std::uint64_t mod,
                           std::uint32_t prime_id,
                           bool inverse) {
-  if (span < 2U || mod == 0U) {
-    return;
-  }
-  const std::uint32_t levels = static_cast<std::uint32_t>(__builtin_ctz(span));
-  for (std::uint32_t level = 0U; level < levels; ++level) {
-    const std::uint32_t block_size = 1U << (levels - level);
-    const std::uint32_t half_block = block_size >> 1U;
-    const std::uint32_t block_num = span / block_size;
-    for (std::uint32_t block_id = 0U; block_id < block_num; ++block_id) {
-      for (std::uint32_t i = 0U; i < half_block; ++i) {
-#pragma HLS PIPELINE II = 1
-        const std::uint32_t idx1 = block_id * block_size + i;
-        const std::uint32_t idx2 = idx1 + half_block;
-        const std::uint32_t exponent =
-            inverse ? (((2U * i) + 1U) * block_num) : ((2U * i) * block_num);
-        const std::uint64_t tw =
-            lookup_ntt_twiddle(mod, prime_id, inverse, exponent, span);
-        const std::uint64_t a = values[idx1] % mod;
-        const std::uint64_t b = values[idx2] % mod;
-        const std::uint64_t out_a = mod_add(a, b, mod);
-        const std::uint64_t sub = mod_sub(a, b, mod);
-        const std::uint64_t out_b = mod_mul(sub, tw, mod);
-        values[idx1] = out_a;
-        values[idx2] = out_b;
-      }
-    }
-  }
+  ntt_apply_negacyclic_four_step(values, span, mod, prime_id, inverse);
 }
 
 inline bool is_memory_opcode(std::uint32_t opcode) {

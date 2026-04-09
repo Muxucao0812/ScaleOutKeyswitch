@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import json
+import os
 import pathlib
 import re
+import time
 import zlib
 from typing import Dict, Iterable, Iterator, List, Sequence
+
+from .generated_ntt_tables import NEGACYCLIC_ROOT_TABLE
 
 _INSTRUCTION_WORD_STRIDE = 4
 _INPUT_MAGIC = 0x43494E4E414D4F4E  # "CINNAMON"
@@ -128,6 +133,68 @@ _SECTION_IDS = {
 
 _IMM_OPERAND_ID = 0xFFF
 _TOKEN_OPERAND_ID = 0xFFE
+_MAX_NTT_SPAN = 64
+_JSONL_ENV = "CINNAMON_FPGA_JSONL_LOG"
+_JSONL_DEBUG_ENV = "CINNAMON_FPGA_JSONL_DEBUG_LOG"
+_JSONL_DEBUG_FLAG_ENV = "CINNAMON_FPGA_JSONL_DEBUG"
+_EXPECTED_LOG_CAP_ENV = "CINNAMON_FPGA_EXPECTED_LOG_CAP"
+_DEBUG_PREVIEW_WORDS = 8
+_expected_log_count = 0
+
+
+def _env_flag(name: str) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _append_jsonl(path: str, payload: Dict[str, object]) -> None:
+    target = pathlib.Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(payload, sort_keys=True, default=str) + "\n"
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def _emit_jsonl(
+    event: str,
+    *,
+    payload: Dict[str, object],
+    debug_payload: Dict[str, object] | None = None,
+) -> None:
+    always_path = os.getenv(_JSONL_ENV, "").strip()
+    debug_enabled = _env_flag(_JSONL_DEBUG_FLAG_ENV)
+    debug_path = os.getenv(_JSONL_DEBUG_ENV, "").strip() or always_path
+    if not always_path and not (debug_enabled and debug_path):
+        return
+
+    base_payload: Dict[str, object] = {
+        "event": event,
+        "ts_unix_s": time.time(),
+        **payload,
+    }
+    if always_path:
+        _append_jsonl(always_path, base_payload)
+    if debug_enabled and debug_path:
+        debug_entry = dict(base_payload)
+        if debug_payload:
+            debug_entry.update(debug_payload)
+        debug_entry["debug"] = True
+        _append_jsonl(debug_path, debug_entry)
+
+
+def _consume_expected_log_budget() -> bool:
+    global _expected_log_count
+    try:
+        budget = int(os.getenv(_EXPECTED_LOG_CAP_ENV, "32"))
+    except ValueError:
+        budget = 32
+    if budget <= 0 or _expected_log_count >= budget:
+        return False
+    _expected_log_count += 1
+    return True
 
 _REG_RE = re.compile(r"^r(\d+)(?:\[X\])?$", re.IGNORECASE)
 _SCALAR_RE = re.compile(r"^s(\d+)(?:\[X\])?$", re.IGNORECASE)
@@ -868,6 +935,153 @@ def _mod_inv(a: int, mod: int) -> int:
     return x % mod
 
 
+def _abs_mod_u32(value: int, mod: int) -> int:
+    if mod == 0:
+        return 0
+    signed = int(value)
+    if signed >= 0:
+        return int(signed % mod)
+    return int((-signed) % mod)
+
+
+def _is_power_of_two(value: int) -> bool:
+    v = int(value)
+    return v > 0 and (v & (v - 1)) == 0
+
+
+def _select_ntt_span(imm0: int, register_count: int) -> int:
+    mod = _MAX_NTT_SPAN + 1
+    signed = int(imm0)
+    span = (signed % mod) if signed >= 0 else ((-signed) % mod)
+    if span < 2 or (not _is_power_of_two(span)):
+        if register_count >= 8:
+            span = 8
+        elif register_count >= 4:
+            span = 4
+        else:
+            span = 2
+    while span > register_count and span > 2:
+        span >>= 1
+    return span
+
+
+def _choose_four_step_shape(span: int) -> tuple[int, int]:
+    levels = int(span).bit_length() - 1
+    row_levels = levels // 2
+    rows = 1 << row_levels
+    cols = 1 << (levels - row_levels)
+    return rows, cols
+
+
+def _resolve_negacyclic_roots(mod: int, span: int, prime_id: int) -> Dict[str, int]:
+    entry = NEGACYCLIC_ROOT_TABLE.get((int(mod), int(span)))
+    if entry is not None:
+        return {
+            "psi": int(entry["psi"]) % mod,
+            "psi_inv": int(entry["psi_inv"]) % mod,
+            "omega": int(entry["omega"]) % mod,
+            "omega_inv": int(entry["omega_inv"]) % mod,
+        }
+    if mod <= 2:
+        return {"psi": 1, "psi_inv": 1, "omega": 1, "omega_inv": 1}
+    omega = 1 + ((int(prime_id) + 17) % (mod - 1))
+    omega_inv = _mod_inv(omega, mod)
+    return {
+        "psi": 1,
+        "psi_inv": 1,
+        "omega": omega % mod,
+        "omega_inv": (omega_inv % mod) if omega_inv != 0 else 1,
+    }
+
+
+def _small_cyclic_dft(input_values: Sequence[int], length: int, root: int, mod: int) -> List[int]:
+    out = [0] * length
+    for k in range(length):
+        step = pow(root, k, mod)
+        tw = 1
+        acc = 0
+        for n in range(length):
+            acc = _mod_add(acc, _mod_mul(input_values[n], tw, mod), mod)
+            tw = _mod_mul(tw, step, mod)
+        out[k] = acc
+    return out
+
+
+def _cyclic_ntt_four_step(
+    values: List[int], span: int, omega: int, mod: int, inverse_cyclic: bool
+) -> None:
+    if span < 2 or mod == 0:
+        return
+    rows, cols = _choose_four_step_shape(span)
+    if rows * cols != span:
+        return
+
+    stage1 = [0] * span
+    stage2 = [0] * span
+    row_root = pow(omega, rows, mod)
+    col_root = pow(omega, cols, mod)
+
+    for n1 in range(rows):
+        lane = [int(values[n1 + rows * n2]) % mod for n2 in range(cols)]
+        row_out = _small_cyclic_dft(lane, cols, row_root, mod)
+        for k2 in range(cols):
+            stage1[n1 * cols + k2] = row_out[k2]
+
+    for n1 in range(rows):
+        tw = 1
+        step = pow(omega, n1, mod)
+        for k2 in range(cols):
+            idx = n1 * cols + k2
+            stage1[idx] = _mod_mul(stage1[idx], tw, mod)
+            tw = _mod_mul(tw, step, mod)
+
+    for n1 in range(rows):
+        for k2 in range(cols):
+            stage2[k2 * rows + n1] = stage1[n1 * cols + k2]
+
+    for k2 in range(cols):
+        lane = [stage2[k2 * rows + n1] for n1 in range(rows)]
+        col_out = _small_cyclic_dft(lane, rows, col_root, mod)
+        for k1 in range(rows):
+            values[k2 + cols * k1] = col_out[k1]
+
+    if inverse_cyclic:
+        span_inv = _mod_inv(span, mod)
+        if span_inv != 0:
+            for i in range(span):
+                values[i] = _mod_mul(values[i], span_inv, mod)
+
+
+def _ntt_apply_negacyclic_four_step(
+    values: List[int], span: int, mod: int, prime_id: int, inverse: bool
+) -> None:
+    if span < 2 or mod == 0 or (not _is_power_of_two(span)):
+        return
+    roots = _resolve_negacyclic_roots(mod, span, prime_id)
+    if not inverse:
+        twist = 1
+        for i in range(span):
+            values[i] = _mod_mul(values[i] % mod, twist, mod)
+            twist = _mod_mul(twist, roots["psi"], mod)
+        _cyclic_ntt_four_step(values, span, roots["omega"], mod, False)
+        return
+
+    _cyclic_ntt_four_step(values, span, roots["omega_inv"], mod, True)
+    twist = 1
+    for i in range(span):
+        values[i] = _mod_mul(values[i] % mod, twist, mod)
+        twist = _mod_mul(twist, roots["psi_inv"], mod)
+
+
+def _compute_trace(state: Sequence[int], register_count: int, module_id: int, executed: int) -> int:
+    acc = (0x9E3779B97F4A7C15 ^ int(module_id)) & 0xFFFFFFFFFFFFFFFF
+    acc ^= (int(executed) << 16) & 0xFFFFFFFFFFFFFFFF
+    for i in range(register_count):
+        acc ^= _hash_mix_u64((int(state[i]) ^ int(i + 1)) & 0xFFFFFFFFFFFFFFFF)
+        acc = _rotl64(acc, 7) & 0xFFFFFFFFFFFFFFFF
+    return acc
+
+
 def _montgomery_reduce_ntt_friendly(a: int, q: int) -> int:
     if q == 0:
         return 0
@@ -1053,7 +1267,8 @@ def _apply_module_op(
     if module_id == 6:
         if register_count == 0:
             return src0 % mod
-        rot = inst.imm0 & 0x7FFFFFFF
+        # Match kernel_common.hpp::abs_mod_u32 semantics for negative immediates.
+        rot = _abs_mod_u32(inst.imm0, register_count)
         if rot == 0:
             rot = inst.rns
         src_idx = inst.src0 % register_count
@@ -1109,11 +1324,33 @@ def expected_module_output_words(
         idx = state_base + i
         state[i] = (int(input_words[idx]) % mod) if idx < len(input_words) else 0
 
-    trace_acc = 0x9E3779B97F4A7C15 ^ module_id
     executed = 0
 
     for inst in _iter_descriptors(instruction_words):
         if not _opcode_matches_module(module_id, inst.opcode):
+            continue
+
+        if module_id == _MODULE_IDS["ntt"]:
+            if bounded == 0:
+                executed += 1
+                continue
+
+            span = _select_ntt_span(inst.imm0, bounded)
+            src_base = int(inst.src0) % bounded
+            dst_base = int(inst.dst) % bounded
+            block = [0] * span
+            for j in range(span):
+                block[j] = int(state[(src_base + j) % bounded]) % mod
+            _ntt_apply_negacyclic_four_step(
+                block,
+                span=span,
+                mod=mod,
+                prime_id=int(inst.rns),
+                inverse=(inst.opcode == _OPCODE_IDS["int"]),
+            )
+            for j in range(span):
+                state[(dst_base + j) % bounded] = int(block[j]) % mod
+            executed += 1
             continue
 
         src0 = _load_operand(state, bounded, inst, False, mod, input_words, state_base)
@@ -1124,8 +1361,6 @@ def expected_module_output_words(
             _OPCODE_IDS["spill"],
             _OPCODE_IDS["snd"],
         ):
-            trace_acc ^= _hash_mix_u64(src0 ^ inst.aux ^ inst.rns)
-            trace_acc &= 0xFFFFFFFFFFFFFFFF
             executed += 1
             continue
 
@@ -1133,9 +1368,6 @@ def expected_module_output_words(
         if bounded > 0:
             state[inst.dst % bounded] = result % mod
 
-        trace_acc ^= _hash_mix_u64(result ^ inst.opcode ^ inst.line_crc)
-        trace_acc = _rotl64(trace_acc, 7)
-        trace_acc &= 0xFFFFFFFFFFFFFFFF
         executed += 1
 
     out = [0] * output_count
@@ -1149,12 +1381,48 @@ def expected_module_output_words(
     if output_count > 4:
         out[4] = partition_id
     if output_count > 5:
-        out[5] = trace_acc
+        out[5] = _compute_trace(state, bounded, module_id, executed)
 
     words_available = max(output_count - _OUTPUT_HEADER_WORDS, 0)
     words_to_copy = min(words_available, bounded)
     for i in range(words_to_copy):
         out[_OUTPUT_HEADER_WORDS + i] = state[i]
+
+    kernel_status = int(out[0]) if len(out) > 0 else None
+    kernel_executed = int(out[1]) if len(out) > 1 else None
+    kernel_register_count = int(out[2]) if len(out) > 2 else None
+    kernel_module_id = int(out[3]) if len(out) > 3 else None
+    kernel_partition_id = int(out[4]) if len(out) > 4 else None
+    kernel_trace_acc = int(out[5]) if len(out) > 5 else None
+
+    debug_payload = None
+    if _env_flag(_JSONL_DEBUG_FLAG_ENV) and _consume_expected_log_budget():
+        debug_payload = {
+            "mismatch_context": {
+                "instruction_words_preview": [
+                    int(word) for word in instruction_words[:_DEBUG_PREVIEW_WORDS]
+                ],
+                "input_words_preview": [int(word) for word in input_words[:_DEBUG_PREVIEW_WORDS]],
+                "output_words_preview": [int(word) for word in out[:_DEBUG_PREVIEW_WORDS]],
+            },
+        }
+    _emit_jsonl(
+        "parser.expected_module_output_words",
+        payload={
+            "partition_id": int(partition_id),
+            "module": str(module_name),
+            "instruction_count": int(len(instruction_words) // _INSTRUCTION_WORD_STRIDE),
+            "input_count": int(len(input_words)),
+            "output_count": int(output_count),
+            "kernel_status": kernel_status,
+            "kernel_executed": kernel_executed,
+            "kernel_register_count": kernel_register_count,
+            "kernel_module_id": kernel_module_id,
+            "kernel_partition_id": kernel_partition_id,
+            "kernel_trace_acc": kernel_trace_acc,
+        },
+        debug_payload=debug_payload,
+    )
     return out
 
 

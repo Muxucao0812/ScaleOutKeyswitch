@@ -214,7 +214,7 @@ int main() {
     assert(out[kHeaderWords + 5] == 228895654);
   }
 
-  // NTT DIT vector from CinnamonRTL/ntt/test/ntt_unit_test.sv (Unit DIT 4).
+  // Negacyclic NTT forward span-4 sanity vector.
   {
     constexpr std::uint64_t mod = 1179649;
     const std::vector<std::uint64_t> input = make_layout_input(
@@ -224,13 +224,13 @@ int main() {
         encode_word0(12, 0, 0, 0, 1, 0), encode_word1(4, 0), 0, 0,
     };
     const auto out = run_kernel(cinnamon_ntt, instructions, input, 8);
-    assert(out[kHeaderWords + 0] == 23008);
-    assert(out[kHeaderWords + 1] == 1132065);
-    assert(out[kHeaderWords + 2] == 384471);
-    assert(out[kHeaderWords + 3] == 819754);
+    assert(out[kHeaderWords + 0] == 1146641);
+    assert(out[kHeaderWords + 1] == 2288);
+    assert(out[kHeaderWords + 2] == 419093);
+    assert(out[kHeaderWords + 3] == 791276);
   }
 
-  // NTT DIF vector from CinnamonRTL/ntt/test/ntt_unit_test.sv (Unit DIF 4).
+  // Negacyclic NTT inverse span-4 sanity vector.
   {
     constexpr std::uint64_t mod = 2752513;
     const std::vector<std::uint64_t> input = make_layout_input(
@@ -240,10 +240,25 @@ int main() {
         encode_word0(13, 0, 0, 0, 9, 0), encode_word1(4, 0), 0, 0,
     };
     const auto out = run_kernel(cinnamon_ntt, instructions, input, 8);
-    assert(out[kHeaderWords + 0] == 2752193);
-    assert(out[kHeaderWords + 1] == 1120);
-    assert(out[kHeaderWords + 2] == 560);
-    assert(out[kHeaderWords + 3] == 1104);
+    assert(out[kHeaderWords + 0] == 2752433);
+    assert(out[kHeaderWords + 1] == 2752237);
+    assert(out[kHeaderWords + 2] == 2752233);
+    assert(out[kHeaderWords + 3] == 2752373);
+  }
+
+  // NTT span-8 roundtrip: forward then inverse restores state.
+  {
+    constexpr std::uint64_t mod = 786433;
+    const std::vector<std::uint64_t> input = make_layout_input(
+        mod, {0, 1, 2, 3, 4, 5, 6, 7});
+    const std::vector<std::uint64_t> instructions = {
+        encode_word0(12, 0, 0, 0, 4, 0), encode_word1(8, 0), 0, 0,
+        encode_word0(13, 0, 0, 0, 4, 0), encode_word1(8, 0), 0, 0,
+    };
+    const auto out = run_kernel(cinnamon_ntt, instructions, input, 8);
+    for (std::uint32_t i = 0; i < 8; ++i) {
+      assert(out[kHeaderWords + i] == i);
+    }
   }
 
   // Base conversion path: bci + pl1 + mod
