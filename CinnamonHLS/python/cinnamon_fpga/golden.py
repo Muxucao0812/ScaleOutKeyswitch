@@ -4,7 +4,7 @@ import json
 import os
 import pathlib
 import time
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 _JSONL_ENV = "CINNAMON_FPGA_JSONL_LOG"
 _JSONL_DEBUG_ENV = "CINNAMON_FPGA_JSONL_DEBUG_LOG"
@@ -134,6 +134,52 @@ def _kernel_header(words: Sequence[int]) -> Dict[str, Any]:
     }
 
 
+def _safe_file_token(value: Any, fallback: str = "na") -> str:
+    text = str(value).strip()
+    if not text:
+        text = fallback
+    safe = []
+    for ch in text:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    token = "".join(safe).strip("._")
+    return token or fallback
+
+
+def _dump_mismatch_payload(
+    *,
+    mismatch_dump_dir: pathlib.Path,
+    mismatch: Dict[str, Any],
+    expected_norm: Sequence[Dict[str, Any]],
+    actual_norm: Sequence[Dict[str, Any]],
+    mismatch_context: Optional[Dict[str, Any]] = None,
+) -> pathlib.Path:
+    mismatch_dump_dir.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    partition_token = _safe_file_token(mismatch.get("partition_id"), "pNA")
+    module_token = _safe_file_token(mismatch.get("module"), "moduleNA")
+    reason_token = _safe_file_token(mismatch.get("reason"), "mismatch")
+    filename = (
+        f"golden_mismatch_{ts}_partition_{partition_token}_module_{module_token}_{reason_token}.json"
+    )
+    path = mismatch_dump_dir / filename
+
+    payload: Dict[str, Any] = {
+        "schema_version": 1,
+        "ts_unix_s": time.time(),
+        "first_mismatch": mismatch,
+        "expected_normalized": list(expected_norm),
+        "actual_normalized": list(actual_norm),
+    }
+    if mismatch_context:
+        payload["context"] = mismatch_context
+
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 def _first_mismatch_summary(
     expected_norm: Sequence[Dict[str, Any]],
     actual_norm: Sequence[Dict[str, Any]],
@@ -213,13 +259,35 @@ def _first_mismatch_summary(
 def compare_case(
     expected_outputs: Sequence[Dict[str, Any]],
     actual_outputs: Sequence[Dict[str, Any]],
+    *,
+    mismatch_dump_dir: Optional[str | pathlib.Path] = None,
+    mismatch_context: Optional[Dict[str, Any]] = None,
+    mismatch_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, str]:
     expected_norm = normalize_kernel_outputs(expected_outputs)
     actual_norm = normalize_kernel_outputs(actual_outputs)
     if expected_norm == actual_norm:
+        if mismatch_out is not None:
+            mismatch_out.clear()
         return True, ""
 
     mismatch = _first_mismatch_summary(expected_norm, actual_norm)
+    if mismatch_out is not None:
+        mismatch_out.clear()
+        mismatch_out.update(mismatch)
+
+    mismatch_dump_path: Optional[pathlib.Path] = None
+    if mismatch_dump_dir is not None:
+        mismatch_dump_path = _dump_mismatch_payload(
+            mismatch_dump_dir=pathlib.Path(mismatch_dump_dir),
+            mismatch=mismatch,
+            expected_norm=expected_norm,
+            actual_norm=actual_norm,
+            mismatch_context=mismatch_context,
+        )
+        if mismatch_out is not None:
+            mismatch_out["mismatch_dump_path"] = str(mismatch_dump_path)
+
     _emit_jsonl(
         "golden.compare_case_mismatch",
         payload={
@@ -252,11 +320,20 @@ def compare_case(
         },
         debug_payload={
             "mismatch_summary": mismatch,
+            "mismatch_dump_path": str(mismatch_dump_path)
+            if mismatch_dump_path is not None
+            else None,
         },
     )
 
+    message = (
+        "Expected and actual kernel outputs differ.\nfirst_mismatch="
+        + json.dumps(mismatch, sort_keys=True)
+    )
+    if mismatch_dump_path is not None:
+        message += f"\nmismatch_dump_path={mismatch_dump_path}"
+
     return (
         False,
-        "Expected and actual kernel outputs differ.\nfirst_mismatch="
-        + json.dumps(mismatch, sort_keys=True),
+        message,
     )

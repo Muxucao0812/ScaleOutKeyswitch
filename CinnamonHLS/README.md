@@ -98,6 +98,24 @@ export PYTHONPATH=/opt/xilinx/xrt/python:CinnamonHLS/python:$PYTHONPATH
 CinnamonHLS/scripts/run_sw_emu_smoke.sh
 ```
 
+## Run Tutorial3 sw_emu Debug Baseline
+
+固定调试基线（`chips=1, boards=0, warmup=0, runs=1, sample_id=1, strict golden`）：
+
+```bash
+# args: [xclbin] [sample_id] [mismatch_dump_dir]
+CinnamonHLS/scripts/run_tutorial3_swemu_debug.sh \
+  CinnamonHLS/build/sw_emu/cinnamon_fpga.sw_emu.xclbin \
+  1 \
+  CinnamonHLS/build/reports/mismatch_swemu_debug
+```
+
+失败时会自动落盘：
+
+- 完整 mismatch 证据 JSON（含 first mismatch + expected/actual 全量 output words）
+- automorphism 回放 fixture（可用于 `test_kernel_descriptor` 单模块复现）
+- instructions/program_inputs/evalkeys/golden 的时间戳归档目录
+
 ## Run Full-Opcode Dispatch Check
 
 This check uses a synthetic instruction stream containing all supported opcodes and verifies

@@ -182,6 +182,41 @@ def _build_partition_input_words(
     return [_INPUT_MAGIC, register_count, mod, *state, *stream_table_words]
 
 
+def _parse_output_stream_descriptors(
+    output_entries: Sequence[str],
+) -> Dict[str, Dict[str, Any]]:
+    descriptors: Dict[str, Dict[str, Any]] = {}
+    for line in output_entries:
+        match = _PROGRAM_INPUT_ENTRY_RE.match(str(line))
+        if not match:
+            continue
+        stream_name = match.group(1).strip()
+        stream_ref = match.group(2).strip()
+        rns_raw = match.group(3).strip()
+        parts = stream_ref.split(":", 1)
+        if len(parts) != 2:
+            continue
+        output_name = parts[0].strip()
+        component = parts[1].strip().lower()
+        if component not in {"c0", "c1"}:
+            continue
+        rns_ids = [int(token.strip()) for token in rns_raw.split(",") if token.strip()]
+        entry = descriptors.setdefault(
+            output_name,
+            {
+                "name": output_name,
+                "c0_term": "",
+                "c1_term": "",
+                "rns_base_ids": [],
+            },
+        )
+        entry[f"{component}_term"] = stream_name
+        if rns_ids:
+            combined = sorted(set(int(v) for v in list(entry["rns_base_ids"]) + rns_ids))
+            entry["rns_base_ids"] = combined
+    return descriptors
+
+
 def _slice_state_from_output(
     output_words: Sequence[int],
     expected_register_count: int,
@@ -256,6 +291,8 @@ class Emulator:
     - generate_inputs
     - run_program
     - get_kernel_outputs
+    - get_output_ciphertexts
+    - get_decrypted_outputs
     """
 
     def __init__(self, context: Any, **kwargs: Any) -> None:
@@ -269,11 +306,40 @@ class Emulator:
         self.last_opcode_summary: Dict[str, int] = {}
         self.last_kernel_outputs: List[Dict[str, Any]] = []
         self.last_timing_summary: Dict[str, Any] = {}
+        self.last_output_ciphertexts: Dict[str, Dict[str, Any]] = {}
+        self._last_instruction_file_base: Optional[str] = None
+        self._last_num_partitions: Optional[int] = None
+        self._last_register_file_size: Optional[int] = None
+        self._run_generation: int = 0
+        self._mirror_generation: int = -1
 
         emulator_mod = _maybe_import_emulator()
         self._emulator = None
         if emulator_mod is not None:
             self._emulator = emulator_mod.Emulator(context)
+
+    def _require_run_context(self) -> None:
+        if (
+            self._last_instruction_file_base is None
+            or self._last_num_partitions is None
+            or self._last_register_file_size is None
+        ):
+            raise RuntimeError("run_program must be called before output/decrypt APIs")
+
+    def _ensure_emulator_mirror_outputs(self) -> None:
+        if self._emulator is None:
+            raise RuntimeError(
+                "get_decrypted_outputs requires cinnamon_emulator to be installed in this environment"
+            )
+        self._require_run_context()
+        if self._mirror_generation == self._run_generation:
+            return
+        self._emulator.run_program(
+            str(self._last_instruction_file_base),
+            int(self._last_num_partitions),
+            int(self._last_register_file_size),
+        )
+        self._mirror_generation = self._run_generation
 
     def _set_emulation_env(self) -> None:
         if self.config.target in ("sw_emu", "hw_emu"):
@@ -349,6 +415,22 @@ class Emulator:
         if program_inputs_path.exists():
             parsed_inputs = parse_program_inputs(program_inputs_path)
             program_input_sections = parsed_inputs.sections
+        output_descriptors = _parse_output_stream_descriptors(program_input_sections.get("output", []))
+        self.last_output_ciphertexts = {
+            name: {
+                "name": str(payload.get("name", name)),
+                "c0_term": str(payload.get("c0_term", "")),
+                "c1_term": str(payload.get("c1_term", "")),
+                "rns_base_ids": [int(v) for v in payload.get("rns_base_ids", [])],
+                "source": "output_stream_descriptor",
+            }
+            for name, payload in output_descriptors.items()
+        }
+        self._last_instruction_file_base = str(instruction_file_base)
+        self._last_num_partitions = int(num_partitions)
+        self._last_register_file_size = int(register_file_size)
+        self._run_generation += 1
+        self._mirror_generation = -1
 
         bounded_register_count = _bounded_register_count(register_file_size)
         per_partition_inputs = [
@@ -621,6 +703,31 @@ class Emulator:
 
     def get_kernel_outputs(self) -> List[Dict[str, Any]]:
         return copy.deepcopy(self.last_kernel_outputs)
+
+    def get_output_ciphertexts(self) -> Dict[str, Dict[str, Any]]:
+        self._require_run_context()
+        payload = copy.deepcopy(self.last_output_ciphertexts)
+        if self._emulator is not None:
+            self._ensure_emulator_mirror_outputs()
+            for value in payload.values():
+                value["source"] = "emulator_mirror"
+        return payload
+
+    def get_decrypted_outputs(
+        self,
+        encryptor: Any,
+        output_scales: Dict[str, float],
+    ) -> Dict[str, Any]:
+        self._ensure_emulator_mirror_outputs()
+        _emit_jsonl(
+            "api.get_decrypted_outputs",
+            payload={
+                "mode": "emulator_mirror",
+                "output_count": len(output_scales),
+                "run_generation": int(self._run_generation),
+            },
+        )
+        return dict(self._emulator.get_decrypted_outputs(encryptor, output_scales))
 
     def _verify_module_dispatch(
         self,

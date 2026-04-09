@@ -1,5 +1,10 @@
 #include <cassert>
+#include <cctype>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include "cinnamon_hls/montgomery.hpp"
@@ -51,6 +56,199 @@ constexpr std::uint64_t kInputMagic = 0x43494E4E414D4F4EULL;
 constexpr std::uint32_t kHeaderWords = 6U;
 constexpr std::uint32_t kImmOperandId = 0xFFFU;
 constexpr std::uint32_t kTokenOperandId = 0xFFEU;
+constexpr const char *kAutomorphismReplayMagic = "CINNAMON_AUTOMORPHISM_REPLAY_V1";
+constexpr const char *kAutomorphismReplayEnv = "CINNAMON_AUTOMORPHISM_REPLAY_FILE";
+
+std::vector<std::uint64_t> run_kernel(
+    void (*kernel)(const std::uint64_t *, const std::uint64_t *, std::uint64_t *,
+                   std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t),
+    const std::vector<std::uint64_t> &instructions,
+    const std::vector<std::uint64_t> &inputs, std::uint32_t register_count,
+    std::uint32_t partition_id);
+
+struct AutomorphismReplayFixture {
+  std::uint32_t partition_id = 0U;
+  std::int64_t mismatch_word_index = -1;
+  std::vector<std::uint64_t> instruction_words;
+  std::vector<std::uint64_t> input_words;
+  std::vector<std::uint64_t> expected_output_words;
+  std::vector<std::uint64_t> actual_output_words;
+};
+
+std::string trim_copy(const std::string &value) {
+  std::size_t begin = 0U;
+  while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin])) != 0) {
+    ++begin;
+  }
+  std::size_t end = value.size();
+  while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1U])) != 0) {
+    --end;
+  }
+  return value.substr(begin, end - begin);
+}
+
+bool parse_key_value(const std::string &line, std::string &key, std::string &value) {
+  std::istringstream iss(line);
+  if (!(iss >> key)) {
+    return false;
+  }
+  std::getline(iss, value);
+  value = trim_copy(value);
+  return true;
+}
+
+bool parse_u64(const std::string &text, std::uint64_t &out) {
+  try {
+    std::size_t consumed = 0U;
+    const unsigned long long value = std::stoull(text, &consumed, 10);
+    if (consumed != text.size()) {
+      return false;
+    }
+    out = static_cast<std::uint64_t>(value);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool parse_i64(const std::string &text, std::int64_t &out) {
+  try {
+    std::size_t consumed = 0U;
+    const long long value = std::stoll(text, &consumed, 10);
+    if (consumed != text.size()) {
+      return false;
+    }
+    out = static_cast<std::int64_t>(value);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool load_automorphism_replay_fixture(const std::string &path,
+                                      AutomorphismReplayFixture &fixture) {
+  std::ifstream ifs(path);
+  if (!ifs) {
+    return false;
+  }
+
+  enum class Section {
+    kMeta,
+    kInstructions,
+    kInputs,
+    kExpectedOutput,
+    kActualOutput,
+  };
+  Section section = Section::kMeta;
+  bool saw_magic = false;
+
+  std::string raw_line;
+  while (std::getline(ifs, raw_line)) {
+    const std::string line = trim_copy(raw_line);
+    if (line.empty()) {
+      continue;
+    }
+    if (!saw_magic) {
+      if (line != kAutomorphismReplayMagic) {
+        return false;
+      }
+      saw_magic = true;
+      continue;
+    }
+
+    if (line == "--instructions--") {
+      section = Section::kInstructions;
+      continue;
+    }
+    if (line == "--inputs--") {
+      section = Section::kInputs;
+      continue;
+    }
+    if (line == "--expected_output--") {
+      section = Section::kExpectedOutput;
+      continue;
+    }
+    if (line == "--actual_output--") {
+      section = Section::kActualOutput;
+      continue;
+    }
+    if (line == "--end--") {
+      break;
+    }
+
+    if (section == Section::kMeta) {
+      std::string key;
+      std::string value;
+      if (!parse_key_value(line, key, value)) {
+        return false;
+      }
+      if (key == "partition_id") {
+        std::uint64_t parsed = 0U;
+        if (!parse_u64(value, parsed)) {
+          return false;
+        }
+        fixture.partition_id = static_cast<std::uint32_t>(parsed);
+      } else if (key == "mismatch_word_index") {
+        std::int64_t parsed = -1;
+        if (!parse_i64(value, parsed)) {
+          return false;
+        }
+        fixture.mismatch_word_index = parsed;
+      }
+      continue;
+    }
+
+    std::uint64_t word = 0U;
+    if (!parse_u64(line, word)) {
+      return false;
+    }
+    if (section == Section::kInstructions) {
+      fixture.instruction_words.push_back(word);
+    } else if (section == Section::kInputs) {
+      fixture.input_words.push_back(word);
+    } else if (section == Section::kExpectedOutput) {
+      fixture.expected_output_words.push_back(word);
+    } else if (section == Section::kActualOutput) {
+      fixture.actual_output_words.push_back(word);
+    }
+  }
+
+  if (!saw_magic) {
+    return false;
+  }
+  if (fixture.instruction_words.empty() || fixture.input_words.empty() ||
+      fixture.expected_output_words.empty()) {
+    return false;
+  }
+  return true;
+}
+
+void run_automorphism_replay_from_fixture(const AutomorphismReplayFixture &fixture) {
+  assert(fixture.input_words.size() >= 3U);
+  assert(fixture.input_words[0] == kInputMagic);
+  const std::uint32_t register_count = static_cast<std::uint32_t>(fixture.input_words[1]);
+  assert(register_count > 0U);
+
+  const auto out = run_kernel(cinnamon_automorphism, fixture.instruction_words,
+                              fixture.input_words, register_count, fixture.partition_id);
+  assert(out.size() == fixture.expected_output_words.size());
+  assert(out[0] == fixture.expected_output_words[0]);  // status
+  assert(out[1] == fixture.expected_output_words[1]);  // executed
+  assert(out[2] == fixture.expected_output_words[2]);  // register_count
+  assert(out[3] == fixture.expected_output_words[3]);  // module_id
+  assert(out[4] == fixture.expected_output_words[4]);  // partition_id
+  assert(out[5] == fixture.expected_output_words[5]);  // trace_acc
+
+  for (std::size_t i = 0U; i < out.size(); ++i) {
+    assert(out[i] == fixture.expected_output_words[i]);
+  }
+
+  if (fixture.mismatch_word_index >= 0 &&
+      static_cast<std::size_t>(fixture.mismatch_word_index) < out.size()) {
+    const std::size_t idx = static_cast<std::size_t>(fixture.mismatch_word_index);
+    assert(out[idx] == fixture.expected_output_words[idx]);
+  }
+}
 
 std::uint64_t encode_word0(std::uint32_t opcode, std::uint32_t dst,
                            std::uint32_t src0, std::uint32_t src1,
@@ -395,6 +593,14 @@ int main() {
     assert(out[kHeaderWords + 5] == 1);
     assert(out[kHeaderWords + 6] == 8);
     assert(out[kHeaderWords + 7] == 6);
+  }
+
+  const char *replay_path = std::getenv(kAutomorphismReplayEnv);
+  if (replay_path != nullptr && replay_path[0] != '\0') {
+    AutomorphismReplayFixture fixture;
+    const bool loaded = load_automorphism_replay_fixture(replay_path, fixture);
+    assert(loaded);
+    run_automorphism_replay_from_fixture(fixture);
   }
 
   return 0;

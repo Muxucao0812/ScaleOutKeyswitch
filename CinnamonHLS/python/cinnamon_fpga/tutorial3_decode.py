@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 SUPPORTED_PRED_DECODE_MODES = (
     "first10",
+    "stride128_first",
     "stride128_mean",
     "stride128_median",
     "stride128_max",
@@ -12,7 +13,7 @@ SUPPORTED_PRED_DECODE_MODES = (
     "explicit16x128_median",
     "explicit16x128_max",
 )
-DEFAULT_PRED_DECODE_MODE = "stride128_mean"
+DEFAULT_PRED_DECODE_MODE = "stride128_first"
 DECODE_MARGIN_FALLBACK_THRESHOLD = 1e-4
 
 
@@ -38,6 +39,29 @@ def decode_scores_with_mode(
             "strategy": mode,
             "class_count": class_count,
             "prefix_length": min(len(values), 10),
+        }
+        return scores, mode, index_map, index_map_preview
+
+    if mode == "stride128_first":
+        stride = 128
+        scores: List[float] = []
+        for cls in range(class_count):
+            idx = cls * stride
+            if idx < len(values):
+                score = float(values[idx])
+            elif cls < len(values):
+                idx = cls
+                score = float(values[idx])
+            else:
+                idx = 0
+                score = 0.0
+            scores.append(score)
+            index_map_preview[str(cls)] = [int(idx)]
+        index_map = {
+            "strategy": mode,
+            "stride": stride,
+            "class_count": class_count,
+            "repeats": 1,
         }
         return scores, mode, index_map, index_map_preview
 
