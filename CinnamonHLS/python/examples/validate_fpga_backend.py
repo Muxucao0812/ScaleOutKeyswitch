@@ -125,8 +125,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Validate Cinnamon FPGA backend using fixed golden kernel outputs (no CPU runtime fallback)"
     )
-    parser.add_argument("--target", choices=["sw_emu", "hw_emu", "hw"], required=True)
-    parser.add_argument("--xclbin", required=True, type=pathlib.Path)
+    parser.add_argument("--target", choices=["sw_emu", "hw_emu", "hw"],  default="sw_emu")
+    parser.add_argument("--xclbin",  default=ROOT_DIR / "build" / "sw_emu" / "cinnamon_fpga.sw_emu.xclbin",  type=pathlib.Path)
     parser.add_argument("--chips", default="1,2,4")
     parser.add_argument("--boards", default="0,1,2,3")
     parser.add_argument(

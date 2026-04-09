@@ -23,21 +23,22 @@ PRIMES = [
     258605057, 260571137, 260702209, 261488641, 261881857, 263323649,
     263454721, 264634369, 265420801, 268042241,
 ]
-
+level = 51
+SCALE_BITS = 56
 
 def build_program(num_chips: int = 1) -> CinnamonProgram:
-    """Build a minimal ciphertext addition program: z = x + y."""
-    program = CinnamonProgram("Add", rns_bit_size=28, num_chips=num_chips)
+    """Build a minimal ciphertext multiplication program: z = x * y."""
+    program = CinnamonProgram("Mul", rns_bit_size=28, num_chips=num_chips)
     with program:
-        x = CiphertextInput("x", 28, 51)
-        y = CiphertextInput("y", 28, 51)
-        z = x + y
+        x = CiphertextInput("x", SCALE_BITS, level)
+        y = CiphertextInput("y", SCALE_BITS, level)
+        z = (x * y).relinearize().rescale().rescale()  # CKKS multiplication usually increases ciphertext scale; rescale back down.
+        
         Output("z", z)
     return program
 
 
 def to_real(value) -> float:
-    """CKKS decrypted outputs may be complex; compare using the real part."""
     if isinstance(value, complex):
         return float(value.real)
     return float(value)
@@ -49,13 +50,7 @@ def to_imag(value) -> float:
     return 0.0
 
 
-def compare_vectors(actual, expected, tolerance: float = 1e-3):
-    """
-    Compare decrypted vector against expected real values.
-    Returns:
-      max_error: maximum absolute error
-      bad: list of mismatches (idx, actual_real, expected, error)
-    """
+def compare_vectors(actual, expected, tolerance: float = 1e-2):
     max_error = 0.0
     bad = []
 
@@ -70,16 +65,16 @@ def compare_vectors(actual, expected, tolerance: float = 1e-3):
 
 
 def main() -> None:
-    out_dir = ROOT_DIR / "build" / "cinnamon_tutorial_add_fpga"
+    out_dir = ROOT_DIR / "build" / "cinnamon_tutorial_mul_fpga"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     num_chips = 1
     register_file_size = 1024
     slots = 64
-    scale = 1 << 28
+    scale = 1 << SCALE_BITS
 
     # -------------------------------------------------
-    # Build and compile a pure addition program
+    # Build and compile a pure multiplication program
     # -------------------------------------------------
     program = build_program(num_chips)
     cinnamon_compile(program, 51, num_chips, register_file_size, str(out_dir) + "/")
@@ -101,17 +96,19 @@ def main() -> None:
     )
 
     # -------------------------------------------------
-    # Prepare raw inputs for addition only
+    # Prepare raw inputs for multiplication only
     # x[i] = i
     # y[i] = 2*i
-    # expected z[i] = 3*i
+    # expected z[i] = 2*i*i
     # -------------------------------------------------
     raw_inputs = {
         "x": ([float(i) for i in range(slots)], scale),
         "y": ([float(2 * i) for i in range(slots)], scale),
     }
-    expected = [float(3 * i) for i in range(slots)]
-    output_scales = {"z": float(scale)}
+    expected = [float(2 * i * i) for i in range(slots)]
+
+    # CKKS multiply usually changes output scale
+    output_scales = {"z": float(scale*scale/(PRIMES[level-1]*PRIMES[level-2]))}
 
     # -------------------------------------------------
     # Run FPGA emulator (sw_emu)
@@ -147,7 +144,6 @@ def main() -> None:
 
     # -------------------------------------------------
     # Use CPU emulator to decrypt program outputs
-    # This follows the tutorial3 pattern
     # -------------------------------------------------
     cpu = cinnamon_emulator.Emulator(context)
     cpu.generate_and_serialize_evalkeys(
@@ -176,9 +172,6 @@ def main() -> None:
     print("\nexpected first 16:")
     print(expected[:16])
 
-    # -------------------------------------------------
-    # Compare only the addition result
-    # -------------------------------------------------
     print("\nDetailed comparison for first 16 slots:")
     for i, (a, e) in enumerate(zip(z_values[:16], expected[:16])):
         a_real = to_real(a)
@@ -189,7 +182,7 @@ def main() -> None:
             f"expected={e:.1f}  err={err:.3e}"
         )
 
-    max_error, bad = compare_vectors(z_values[:slots], expected[:slots], tolerance=1e-3)
+    max_error, bad = compare_vectors(z_values[:slots], expected[:slots], tolerance=1e-2)
 
     print(f"\nmax_error = {max_error:.6e}")
     print(f"mismatch_count = {len(bad)}")
@@ -200,9 +193,9 @@ def main() -> None:
             print(
                 f"idx={idx:2d}  actual={actual:.9f}  expected={exp:.1f}  err={err:.3e}"
             )
-        print("\nFAIL: addition result does not match expected values.")
+        print("\nFAIL: multiplication result does not match expected values.")
     else:
-        print("\nPASS: addition result matches expected values.")
+        print("\nPASS: multiplication result matches expected values.")
 
 
 if __name__ == "__main__":

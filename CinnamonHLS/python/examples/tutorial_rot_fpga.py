@@ -9,7 +9,6 @@ from cinnamon.dsl import CiphertextInput, CinnamonProgram, Output
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parents[2]
 
-# Reference primes used by Cinnamon tutorial examples.
 PRIMES = [
     204865537, 205651969, 206307329, 207880193, 209059841, 210370561,
     211025921, 211812353, 214171649, 215482369, 215744513, 216137729,
@@ -23,21 +22,21 @@ PRIMES = [
     258605057, 260571137, 260702209, 261488641, 261881857, 263323649,
     263454721, 264634369, 265420801, 268042241,
 ]
+SCALE_BITS = 56
+LEVEL = 51
+ROTATE_STEPS = 8
 
 
-def build_program(num_chips: int = 1) -> CinnamonProgram:
-    """Build a minimal ciphertext addition program: z = x + y."""
-    program = CinnamonProgram("Add", rns_bit_size=28, num_chips=num_chips)
+def build_program(num_chips: int = 1, rotate_steps: int = 8) -> CinnamonProgram:
+    program = CinnamonProgram("Rotate8", rns_bit_size=28, num_chips=num_chips)
     with program:
-        x = CiphertextInput("x", 28, 51)
-        y = CiphertextInput("y", 28, 51)
-        z = x + y
+        x = CiphertextInput("x", SCALE_BITS, LEVEL)
+        z = (x >> rotate_steps)
         Output("z", z)
     return program
 
 
 def to_real(value) -> float:
-    """CKKS decrypted outputs may be complex; compare using the real part."""
     if isinstance(value, complex):
         return float(value.real)
     return float(value)
@@ -50,43 +49,36 @@ def to_imag(value) -> float:
 
 
 def compare_vectors(actual, expected, tolerance: float = 1e-3):
-    """
-    Compare decrypted vector against expected real values.
-    Returns:
-      max_error: maximum absolute error
-      bad: list of mismatches (idx, actual_real, expected, error)
-    """
     max_error = 0.0
     bad = []
-
     for i, (a, e) in enumerate(zip(actual, expected)):
         a_real = to_real(a)
-        error = abs(a_real - e)
-        max_error = max(max_error, error)
-        if error > tolerance:
-            bad.append((i, a_real, e, error))
-
+        err = abs(a_real - e)
+        max_error = max(max_error, err)
+        if err > tolerance:
+            bad.append((i, a_real, e, err))
     return max_error, bad
 
 
+def expected_left_rotate(values, steps):
+    n = len(values)
+    steps %= n
+    return [values[(i - steps) % n] for i in range(n)]
+
+
 def main() -> None:
-    out_dir = ROOT_DIR / "build" / "cinnamon_tutorial_add_fpga"
+    out_dir = ROOT_DIR / "build" / "cinnamon_tutorial_rot8_fpga"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     num_chips = 1
     register_file_size = 1024
     slots = 64
-    scale = 1 << 28
+    scale = 1 << SCALE_BITS
+    rotate_steps = ROTATE_STEPS
 
-    # -------------------------------------------------
-    # Build and compile a pure addition program
-    # -------------------------------------------------
-    program = build_program(num_chips)
-    cinnamon_compile(program, 51, num_chips, register_file_size, str(out_dir) + "/")
+    program = build_program(num_chips, rotate_steps)
+    cinnamon_compile(program, LEVEL, num_chips, register_file_size, str(out_dir) + "/")
 
-    # -------------------------------------------------
-    # Build CKKS context / key
-    # -------------------------------------------------
     context = cinnamon_emulator.Context(slots, PRIMES)
 
     secret_key = [0] * (2 * slots)
@@ -100,22 +92,13 @@ def main() -> None:
         [0, 1, 2, 3, 4, 5, 6, 7],
     )
 
-    # -------------------------------------------------
-    # Prepare raw inputs for addition only
-    # x[i] = i
-    # y[i] = 2*i
-    # expected z[i] = 3*i
-    # -------------------------------------------------
+    x_values = [float(i) for i in range(slots)]
     raw_inputs = {
-        "x": ([float(i) for i in range(slots)], scale),
-        "y": ([float(2 * i) for i in range(slots)], scale),
+        "x": (x_values, scale),
     }
-    expected = [float(3 * i) for i in range(slots)]
+    expected = expected_left_rotate(x_values, rotate_steps)
     output_scales = {"z": float(scale)}
 
-    # -------------------------------------------------
-    # Run FPGA emulator (sw_emu)
-    # -------------------------------------------------
     runtime = cinnamon_fpga.Emulator(
         context,
         target="sw_emu",
@@ -145,10 +128,6 @@ def main() -> None:
     print("dispatch:", cinnamon_fpga.describe_last_dispatch(runtime))
     print("kernel outputs:", runtime.get_kernel_outputs())
 
-    # -------------------------------------------------
-    # Use CPU emulator to decrypt program outputs
-    # This follows the tutorial3 pattern
-    # -------------------------------------------------
     cpu = cinnamon_emulator.Emulator(context)
     cpu.generate_and_serialize_evalkeys(
         str(out_dir / "evalkeys"),
@@ -170,15 +149,13 @@ def main() -> None:
     decrypted = cpu.get_decrypted_outputs(encryptor, output_scales)
     z_values = list(decrypted.get("z", []))
 
+    print(f"\nrotation steps = {rotate_steps}")
     print("\ndecrypted z first 16:")
     print(z_values[:16])
 
     print("\nexpected first 16:")
     print(expected[:16])
 
-    # -------------------------------------------------
-    # Compare only the addition result
-    # -------------------------------------------------
     print("\nDetailed comparison for first 16 slots:")
     for i, (a, e) in enumerate(zip(z_values[:16], expected[:16])):
         a_real = to_real(a)
@@ -200,9 +177,9 @@ def main() -> None:
             print(
                 f"idx={idx:2d}  actual={actual:.9f}  expected={exp:.1f}  err={err:.3e}"
             )
-        print("\nFAIL: addition result does not match expected values.")
+        print("\nFAIL: rotation result does not match expected values.")
     else:
-        print("\nPASS: addition result matches expected values.")
+        print("\nPASS: rotation result matches expected values.")
 
 
 if __name__ == "__main__":

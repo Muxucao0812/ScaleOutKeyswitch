@@ -31,7 +31,7 @@ def build_program(num_chips: int = 1) -> CinnamonProgram:
     with program:
         x = CiphertextInput("x", 28, 51)
         y = CiphertextInput("y", 28, 51)
-        z = x + y
+        z = x - y
         Output("z", z)
     return program
 
@@ -110,7 +110,7 @@ def main() -> None:
         "x": ([float(i) for i in range(slots)], scale),
         "y": ([float(2 * i) for i in range(slots)], scale),
     }
-    expected = [float(3 * i) for i in range(slots)]
+    expected = [float(-1 * i) for i in range(slots)]
     output_scales = {"z": float(scale)}
 
     # -------------------------------------------------
