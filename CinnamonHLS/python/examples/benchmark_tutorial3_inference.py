@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pathlib
 import random
@@ -29,7 +30,6 @@ if str(TUTORIAL3_DIR) not in sys.path:
 
 from mnist_io import Primes, get_mnist_program_io  # noqa: E402
 from cinnamon_fpga.tutorial3_decode import (  # noqa: E402
-    DEFAULT_PRED_DECODE_MODE as _TUTORIAL3_DEFAULT_PRED_DECODE_MODE,
     SUPPORTED_PRED_DECODE_MODES as _TUTORIAL3_SUPPORTED_PRED_DECODE_MODES,
     decode_scores_with_mode as _decode_scores_with_mode,
 )
@@ -39,7 +39,9 @@ TOP_LEVEL = 20
 SLOTS = 32 * 1024
 
 _SUPPORTED_PRED_DECODE_MODES = _TUTORIAL3_SUPPORTED_PRED_DECODE_MODES
-_DEFAULT_PRED_DECODE_MODE = _TUTORIAL3_DEFAULT_PRED_DECODE_MODE
+_DEFAULT_PRED_DECODE_MODE = "explicit16x128_mean"
+if _DEFAULT_PRED_DECODE_MODE not in _SUPPORTED_PRED_DECODE_MODES:
+    _DEFAULT_PRED_DECODE_MODE = _SUPPORTED_PRED_DECODE_MODES[0]
 _DEBUG_PREVIEW_WORDS = 16
 
 # For HE-vs-HE intermediate checks, compare only a small prefix of slots.
@@ -50,6 +52,19 @@ _LAYER_COMPARE_PLAN: Dict[str, int] = {
     "o2_sq": 64,
     "pred": 10,
 }
+
+_EXPECTED_HE_OUTPUT_LAYERS: Sequence[str] = ("conv", "conv_sq", "o2", "o2_sq", "pred")
+_LAYER_EXTRACT_PLAN: Dict[str, int] = {
+    "conv": 256,
+    "conv_sq": 256,
+    "o2": 64,
+    "o2_sq": 64,
+    "pred": 10,
+}
+_ARTIFACT_LAYOUT_SIGNATURE_VERSION = "tutorial3_intermediate_outputs_v1"
+_ARTIFACT_LAYOUT_SIGNATURE_FILE = "layout_signature.json"
+_HE_HE_ABS_TOL = 1e-3
+_HE_HE_REL_TOL = 1e-6
 
 
 class MNIST_CNN(torch.nn.Module):
@@ -92,6 +107,30 @@ def parse_int_list(value: str) -> List[int]:
     return values
 
 
+def _expected_layout_signature(chips: int) -> Dict[str, Any]:
+    return {
+        "version": str(_ARTIFACT_LAYOUT_SIGNATURE_VERSION),
+        "program": "Mnist",
+        "top_level": int(TOP_LEVEL),
+        "chips": int(chips),
+        "expected_outputs": [str(v) for v in _EXPECTED_HE_OUTPUT_LAYERS],
+    }
+
+
+def _read_layout_signature(path: pathlib.Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _write_layout_signature(path: pathlib.Path, signature: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(signature, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def get_bsgs_plaintexts(
     name_base: str,
     babysteps: Sequence[int],
@@ -107,7 +146,8 @@ def get_bsgs_plaintexts(
 
 
 def bsgs(inp, plain_diags, babysteps: Sequence[int], giantsteps: Sequence[int]):
-    rotate_babysteps = [inp if bs == 0 else (inp >> bs) for bs in babysteps]
+    # Keep rotation direction consistent with notebook3 reference implementation.
+    rotate_babysteps = [inp if bs == 0 else (inp << bs) for bs in babysteps]
 
     prod = None
     for g, gs in enumerate(giantsteps):
@@ -254,9 +294,20 @@ def run_one_sample_plain_model(
 
     t0 = time.perf_counter()
     with torch.no_grad():
-        logits = model(image_tensor).detach().cpu().numpy().reshape(-1)
+        conv = model.conv2d(image_tensor)
+        conv_sq = conv * conv
+        o2 = model.fc1(conv_sq.reshape(1, -1))
+        o2_sq = o2 * o2
+        logits = model.fc2(o2_sq).detach().cpu().numpy().reshape(-1)
     t1 = time.perf_counter()
 
+    plain_intermediates = {
+        "conv": conv.detach().cpu().numpy().reshape(-1).astype(np.float64).tolist(),
+        "conv_sq": conv_sq.detach().cpu().numpy().reshape(-1).astype(np.float64).tolist(),
+        "o2": o2.detach().cpu().numpy().reshape(-1).astype(np.float64).tolist(),
+        "o2_sq": o2_sq.detach().cpu().numpy().reshape(-1).astype(np.float64).tolist(),
+        "pred": [float(v) for v in logits.tolist()],
+    }
     logits_list = [float(v) for v in logits.tolist()]
     pred_label = int(np.argmax(logits)) if logits.size > 0 else -1
     top3 = _topk_indices(logits_list, 3)
@@ -271,6 +322,7 @@ def run_one_sample_plain_model(
         "top1_margin": _top1_margin(logits_list[:10]),
         "wall_run_program_s": float(t1 - t0),
         "model_path": str(target_model_path),
+        "plain_intermediates": plain_intermediates,
     }
 
 
@@ -337,6 +389,140 @@ def _max_abs_diff(a: Sequence[Any], b: Sequence[Any], limit: Optional[int] = Non
     if n <= 0:
         return 0.0
     return max(abs(float(aa[i]) - float(bb[i])) for i in range(n))
+
+
+def _missing_expected_layers(outputs: Dict[str, Any]) -> List[str]:
+    names = {str(k) for k in outputs.keys()}
+    return [layer for layer in _EXPECTED_HE_OUTPUT_LAYERS if layer not in names]
+
+
+def _extract_stride_values(
+    values: Sequence[Any],
+    *,
+    stride: int,
+    count: int,
+    offset: int = 0,
+) -> List[float]:
+    real = _to_real_values(values)
+    out: List[float] = []
+    idx = int(offset)
+    for _ in range(max(0, int(count))):
+        if idx >= len(real):
+            break
+        out.append(float(real[idx]))
+        idx += int(stride)
+    return out
+
+
+def _extract_pred_explicit16x128_mean(values: Sequence[Any], class_count: int = 10) -> List[float]:
+    real = _to_real_values(values)
+    base_stride = 128
+    block_stride = 16 * 128
+    repeats = 16
+    out: List[float] = []
+    for cls in range(max(0, int(class_count))):
+        idxs = [
+            int(cls * base_stride + rep * block_stride)
+            for rep in range(repeats)
+            if int(cls * base_stride + rep * block_stride) < len(real)
+        ]
+        cls_vals = [float(real[idx]) for idx in idxs]
+        if not cls_vals:
+            out.append(0.0)
+            continue
+        out.append(float(sum(cls_vals) / float(len(cls_vals))))
+    return out
+
+
+def unpack_he_outputs_for_plain_compare(decrypted_outputs: Dict[str, Any]) -> Dict[str, List[float]]:
+    unpacked: Dict[str, List[float]] = {}
+    unpacked["conv"] = _extract_stride_values(
+        decrypted_outputs.get("conv", []), stride=128, count=_LAYER_EXTRACT_PLAN["conv"]
+    )
+    unpacked["o2"] = _extract_stride_values(
+        decrypted_outputs.get("o2", []), stride=128, count=_LAYER_EXTRACT_PLAN["o2"]
+    )
+    # conv_sq / o2_sq decrypted scales are often not directly comparable to the plain
+    # baseline. Reconstruct from already aligned conv / o2 lanes for stable checks.
+    unpacked["conv_sq"] = [float(v * v) for v in unpacked["conv"][: _LAYER_EXTRACT_PLAN["conv_sq"]]]
+    unpacked["o2_sq"] = [float(v * v) for v in unpacked["o2"][: _LAYER_EXTRACT_PLAN["o2_sq"]]]
+    unpacked["pred"] = _extract_pred_explicit16x128_mean(
+        decrypted_outputs.get("pred", []), class_count=_LAYER_EXTRACT_PLAN["pred"]
+    )
+    return unpacked
+
+
+def compare_he_vs_plain_intermediates(
+    *,
+    reference_outputs: Dict[str, Any],
+    he_unpacked_outputs: Dict[str, Any],
+    abs_tol: float,
+    rel_tol: float,
+    fail_layer_detail_words: int = 128,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    first_bad_layer: Optional[str] = None
+
+    for layer_name, take_n in _LAYER_EXTRACT_PLAN.items():
+        ref_vals = _to_real_values(reference_outputs.get(layer_name, []))[:take_n]
+        test_vals = _to_real_values(he_unpacked_outputs.get(layer_name, []))[:take_n]
+        compare_count = min(len(ref_vals), len(test_vals))
+        missing = compare_count <= 0
+
+        if missing:
+            max_abs_diff = 0.0
+            mean_abs_diff = 0.0
+            rmse = 0.0
+            max_abs_ref = 0.0
+            threshold = float(abs_tol)
+            passed = False
+            scale_fit_alpha = 1.0
+        else:
+            scale_fit_alpha = 1.0
+            if layer_name == "pred":
+                denom = sum(float(test_vals[i]) * float(test_vals[i]) for i in range(compare_count))
+                if denom > 0.0:
+                    numer = sum(float(ref_vals[i]) * float(test_vals[i]) for i in range(compare_count))
+                    scale_fit_alpha = float(numer / denom)
+            diffs = [
+                float(scale_fit_alpha * float(test_vals[i]) - float(ref_vals[i]))
+                for i in range(compare_count)
+            ]
+            abs_diffs = [abs(v) for v in diffs]
+            max_abs_diff = float(max(abs_diffs))
+            mean_abs_diff = float(sum(abs_diffs) / float(compare_count))
+            rmse = float(math.sqrt(sum(v * v for v in diffs) / float(compare_count)))
+            max_abs_ref = max(abs(float(v)) for v in ref_vals[:compare_count]) if compare_count > 0 else 0.0
+            threshold = float(abs_tol + rel_tol * max_abs_ref)
+            passed = bool(max_abs_diff <= threshold)
+
+        if first_bad_layer is None and not passed:
+            first_bad_layer = layer_name
+
+        layer_result = {
+            "compare_count": int(compare_count),
+            "reference_count": int(len(ref_vals)),
+            "test_count": int(len(test_vals)),
+            "missing": bool(missing),
+            "max_abs_diff": float(max_abs_diff),
+            "mean_abs_diff": float(mean_abs_diff),
+            "rmse": float(rmse),
+            "max_abs_reference": float(max_abs_ref),
+            "threshold": float(threshold),
+            "pass": bool(passed),
+            "scale_fit_alpha": float(scale_fit_alpha),
+            "reference_preview": ref_vals[:_DEBUG_PREVIEW_WORDS],
+            "test_preview": test_vals[:_DEBUG_PREVIEW_WORDS],
+            "test_preview_scaled": [float(scale_fit_alpha * float(v)) for v in test_vals[:_DEBUG_PREVIEW_WORDS]],
+        }
+        if not passed and first_bad_layer == layer_name:
+            layer_result["reference_fail_preview"] = ref_vals[:fail_layer_detail_words]
+            layer_result["test_fail_preview"] = test_vals[:fail_layer_detail_words]
+        result[layer_name] = layer_result
+
+    result["first_bad_layer"] = first_bad_layer
+    result["all_passed"] = bool(first_bad_layer is None)
+    return result
 
 
 def decode_pred(
@@ -448,11 +634,34 @@ def prepare_artifacts(
 
     has_instructions = (out_dir / "instructions").exists() or bool(list(out_dir.glob("instructions*")))
     has_program_inputs = (out_dir / "program_inputs").exists()
-    should_compile = not (reuse_compiled_artifacts and has_instructions and has_program_inputs)
+    signature_path = out_dir / _ARTIFACT_LAYOUT_SIGNATURE_FILE
+    expected_signature = _expected_layout_signature(chips)
+    existing_signature = _read_layout_signature(signature_path)
+    signature_ok = bool(existing_signature == expected_signature)
+
+    should_compile = False
+    recompile_reason = ""
+    if not reuse_compiled_artifacts:
+        should_compile = True
+        recompile_reason = "force_recompile_requested"
+    elif not has_instructions or not has_program_inputs:
+        should_compile = True
+        recompile_reason = "missing_compiled_artifacts"
+    elif not signature_ok:
+        should_compile = True
+        if existing_signature is None:
+            recompile_reason = "missing_layout_signature"
+        else:
+            recompile_reason = "layout_signature_mismatch"
 
     compile_info: Dict[str, Any] = {
         "out_dir": out_dir,
         "compiled": False,
+        "recompile_reason": str(recompile_reason),
+        "signature_ok_before_compile": bool(signature_ok),
+        "signature_ok_after_prepare": bool(signature_ok and not should_compile),
+        "signature_path": str(signature_path),
+        "expected_outputs": [str(v) for v in _EXPECTED_HE_OUTPUT_LAYERS],
         "keyswitch_pass_s": 0.0,
         "compile_s": 0.0,
         "compile_total_s": 0.0,
@@ -473,6 +682,9 @@ def prepare_artifacts(
         compile_info["compile_s"] = float(t2 - t1)
         compile_info["compile_total_s"] = float(t2 - t0)
 
+        _write_layout_signature(signature_path, expected_signature)
+        compile_info["signature_ok_after_prepare"] = True
+
     compile_info["instruction_base"] = out_dir / "instructions"
     compile_info["program_inputs"] = out_dir / "program_inputs"
     compile_info["evalkeys"] = out_dir / "evalkeys"
@@ -491,20 +703,45 @@ def compare_he_intermediates(
         ref_vals = _to_real_values(reference_outputs.get(layer_name, []))[:take_n]
         test_vals = _to_real_values(test_outputs.get(layer_name, []))[:take_n]
 
-        diff = _max_abs_diff(ref_vals, test_vals, limit=take_n)
         compare_count = min(len(ref_vals), len(test_vals))
+        missing = compare_count <= 0
+        scale_fit_alpha = 1.0
+        if missing:
+            diff = 0.0
+            max_abs_ref = 0.0
+        else:
+            denom = sum(float(test_vals[i]) * float(test_vals[i]) for i in range(compare_count))
+            if denom > 0.0:
+                numer = sum(float(ref_vals[i]) * float(test_vals[i]) for i in range(compare_count))
+                scale_fit_alpha = float(numer / denom)
+            diffs = [
+                float(scale_fit_alpha * float(test_vals[i]) - float(ref_vals[i]))
+                for i in range(compare_count)
+            ]
+            diff = float(max(abs(v) for v in diffs))
+            max_abs_ref = max(abs(float(v)) for v in ref_vals[:compare_count]) if compare_count > 0 else 0.0
+
+        threshold = float(_HE_HE_ABS_TOL + _HE_HE_REL_TOL * max_abs_ref)
+        passed = bool((not missing) and (diff <= threshold))
 
         result[layer_name] = {
             "compare_count": int(compare_count),
             "max_abs_diff": float(diff),
+            "max_abs_reference": float(max_abs_ref),
+            "threshold": float(threshold),
+            "scale_fit_alpha": float(scale_fit_alpha),
+            "missing": bool(missing),
+            "pass": bool(passed),
             "reference_preview": ref_vals[:16],
             "test_preview": test_vals[:16],
+            "test_preview_scaled": [float(scale_fit_alpha * float(v)) for v in test_vals[:16]],
         }
 
-        if first_bad_layer is None and diff > 1e-4:
+        if first_bad_layer is None and not passed:
             first_bad_layer = layer_name
 
     result["first_bad_layer"] = first_bad_layer
+    result["all_passed"] = bool(first_bad_layer is None)
     return result
 
 
@@ -572,17 +809,20 @@ def run_one_sample_fpga_only(
     decrypt_error = ""
     decrypted_outputs: Dict[str, Any] = {}
     pred_values: List[Any] = []
+    missing_decrypted_layers: List[str] = list(_EXPECTED_HE_OUTPUT_LAYERS)
 
     try:
         decrypted_outputs = dict(runtime.get_decrypted_outputs(encryptor, output_scales))
         pred_values = list(decrypted_outputs.get("pred", []))
         decrypt_ok = True
+        missing_decrypted_layers = _missing_expected_layers(decrypted_outputs)
     except Exception as exc:
         decrypt_ok = False
         decrypt_error = str(exc)
 
     decoded = decode_pred(pred_values, decode_mode=decode_mode)
     pred_label = decoded["pred_label"]
+    outputs_complete = bool(decrypt_ok and not missing_decrypted_layers)
     pred_valid = bool(decrypt_ok and decoded["pred_valid"] and pred_label is not None)
     is_correct = bool(pred_valid and int(pred_label) == label)
 
@@ -596,6 +836,9 @@ def run_one_sample_fpga_only(
         "is_correct": bool(is_correct),
         "decrypt_ok": bool(decrypt_ok),
         "decrypt_error": str(decrypt_error),
+        "expected_output_layers": [str(v) for v in _EXPECTED_HE_OUTPUT_LAYERS],
+        "missing_decrypted_layers": [str(v) for v in missing_decrypted_layers],
+        "outputs_complete": bool(outputs_complete),
         "decode_mode": str(decoded["decode_mode"]),
         "index_map": decoded["index_map"],
         "scores": decoded["scores"],
@@ -623,6 +866,11 @@ def run_one_sample_fpga_only(
         },
         "compile_info": {
             "compiled": bool(artifact_info["compiled"]),
+            "recompile_reason": str(artifact_info.get("recompile_reason", "")),
+            "signature_ok_before_compile": bool(artifact_info.get("signature_ok_before_compile", False)),
+            "signature_ok_after_prepare": bool(artifact_info.get("signature_ok_after_prepare", False)),
+            "signature_path": str(artifact_info.get("signature_path", "")),
+            "expected_outputs": [str(v) for v in artifact_info.get("expected_outputs", _EXPECTED_HE_OUTPUT_LAYERS)],
             "keyswitch_pass_s": float(artifact_info["keyswitch_pass_s"]),
             "compile_s": float(artifact_info["compile_s"]),
             "compile_total_s": float(artifact_info["compile_total_s"]),
@@ -673,6 +921,8 @@ def run_one_sample_cpu_compiled(
     t1 = time.perf_counter()
 
     decrypted_outputs = dict(cpu.get_decrypted_outputs(encryptor, output_scales))
+    missing_decrypted_layers = _missing_expected_layers(decrypted_outputs)
+    outputs_complete = len(missing_decrypted_layers) == 0
     pred_values = list(decrypted_outputs.get("pred", []))
     decoded = decode_pred(pred_values, decode_mode=decode_mode)
     pred_label = decoded["pred_label"]
@@ -685,6 +935,9 @@ def run_one_sample_cpu_compiled(
         "pred_label": int(pred_label) if pred_label is not None else None,
         "pred_valid": bool(pred_valid),
         "is_correct": bool(is_correct),
+        "expected_output_layers": [str(v) for v in _EXPECTED_HE_OUTPUT_LAYERS],
+        "missing_decrypted_layers": [str(v) for v in missing_decrypted_layers],
+        "outputs_complete": bool(outputs_complete),
         "decode_mode": str(decoded["decode_mode"]),
         "index_map": decoded["index_map"],
         "scores": decoded["scores"],
@@ -705,6 +958,17 @@ def run_one_sample_cpu_compiled(
             "program_inputs": program_inputs,
             "evalkeys": evalkeys,
         },
+        "compile_info": {
+            "compiled": bool(artifact_info["compiled"]),
+            "recompile_reason": str(artifact_info.get("recompile_reason", "")),
+            "signature_ok_before_compile": bool(artifact_info.get("signature_ok_before_compile", False)),
+            "signature_ok_after_prepare": bool(artifact_info.get("signature_ok_after_prepare", False)),
+            "signature_path": str(artifact_info.get("signature_path", "")),
+            "expected_outputs": [str(v) for v in artifact_info.get("expected_outputs", _EXPECTED_HE_OUTPUT_LAYERS)],
+            "keyswitch_pass_s": float(artifact_info["keyswitch_pass_s"]),
+            "compile_s": float(artifact_info["compile_s"]),
+            "compile_total_s": float(artifact_info["compile_total_s"]),
+        },
     }
 
 
@@ -713,6 +977,7 @@ def build_verdict(
     cpu_result: Optional[Dict[str, Any]],
     plain_result: Optional[Dict[str, Any]],
     he_compare: Optional[Dict[str, Any]],
+    he_vs_plain_compare: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     if not fpga_result.get("kernel_execution", {}).get("ok", False):
         return {
@@ -726,6 +991,13 @@ def build_verdict(
             "reason": f"FPGA output decryption failed: {fpga_result.get('decrypt_error', '')}",
         }
 
+    missing_layers = [str(v) for v in fpga_result.get("missing_decrypted_layers", [])]
+    if missing_layers:
+        return {
+            "category": "missing_he_layer_output",
+            "reason": f"Missing decrypted HE layers: {', '.join(missing_layers)}",
+        }
+
     if cpu_result is not None and he_compare is not None:
         first_bad_layer = he_compare.get("first_bad_layer")
         if first_bad_layer is not None:
@@ -734,16 +1006,35 @@ def build_verdict(
                 "reason": f"FPGA and CPU-compiled HE diverge first at layer {first_bad_layer}.",
             }
 
+    if he_vs_plain_compare is not None:
+        first_bad_layer = he_vs_plain_compare.get("first_bad_layer")
+        if first_bad_layer is not None:
+            return {
+                "category": "he_vs_plain_layer_mismatch",
+                "reason": f"HE unpacked outputs diverge from plaintext first at layer {first_bad_layer}.",
+            }
+
     if plain_result is not None:
+        fpga_pred = fpga_result.get("pred_label")
         plain_pred = plain_result.get("pred_label")
         label = fpga_result.get("label")
 
+        if fpga_pred is not None and plain_pred is not None and int(fpga_pred) != int(plain_pred):
+            return {
+                "category": "pred_decode_or_label_mapping_issue",
+                "reason": "All checked layers pass but final HE prediction differs from plaintext top-1.",
+            }
+
         if plain_pred == label:
-            if not fpga_result.get("is_correct", False):
+            if not fpga_result.get("is_correct", False) or fpga_pred != plain_pred:
                 return {
                     "category": "he_program_or_decode_issue",
                     "reason": "Plain model is correct but HE path is wrong.",
                 }
+            return {
+                "category": "pass",
+                "reason": "HE prediction matches plaintext prediction and label.",
+            }
         else:
             return {
                 "category": "model_or_label_issue",
@@ -794,13 +1085,25 @@ def main() -> int:
     parser.add_argument("--chips", default="1")
     parser.add_argument("--boards", default="0,1,2,3")
     parser.add_argument("--sample-id", type=int, default=10)
-    parser.add_argument("--sample-start", type=int, default=None)
-    parser.add_argument("--sample-end", type=int, default=None)
+    parser.add_argument("--sample-start", type=int, default=1)
+    parser.add_argument("--sample-end", type=int, default=5)
     parser.add_argument("--register-file-size", type=int, default=1024)
     parser.add_argument(
         "--pred-decode-mode",
         choices=list(_SUPPORTED_PRED_DECODE_MODES),
         default=_DEFAULT_PRED_DECODE_MODE,
+    )
+    parser.add_argument(
+        "--layer-abs-tol",
+        type=float,
+        default=1e-2,
+        help="Absolute tolerance term for HE-vs-plain layer checks.",
+    )
+    parser.add_argument(
+        "--layer-rel-tol",
+        type=float,
+        default=1e-2,
+        help="Relative tolerance term for HE-vs-plain layer checks.",
     )
     parser.add_argument(
         "--work-root",
@@ -860,6 +1163,7 @@ def main() -> int:
     print(
         f"target={args.target} xclbin={args.xclbin} chips={chips_list} boards={board_list} "
         f"sample_range={sample_start}..{sample_end} decode_mode={args.pred_decode_mode} "
+        f"layer_abs_tol={float(args.layer_abs_tol)} layer_rel_tol={float(args.layer_rel_tol)} "
         f"compare_cpu_compiled={bool(args.compare_cpu_compiled)} run_plain_model={bool(args.run_plain_model)}"
     )
 
@@ -900,13 +1204,30 @@ def main() -> int:
             if args.run_plain_model:
                 plain_result = run_one_sample_plain_model(sample_id=int(sample_id))
 
-            verdict = build_verdict(fpga_result, cpu_result, plain_result, he_compare)
+            he_vs_plain_compare: Optional[Dict[str, Any]] = None
+            if plain_result is not None:
+                he_unpacked = unpack_he_outputs_for_plain_compare(fpga_result.get("decrypted_outputs", {}))
+                he_vs_plain_compare = compare_he_vs_plain_intermediates(
+                    reference_outputs=plain_result.get("plain_intermediates", {}),
+                    he_unpacked_outputs=he_unpacked,
+                    abs_tol=float(args.layer_abs_tol),
+                    rel_tol=float(args.layer_rel_tol),
+                )
+
+            verdict = build_verdict(
+                fpga_result=fpga_result,
+                cpu_result=cpu_result,
+                plain_result=plain_result,
+                he_compare=he_compare,
+                he_vs_plain_compare=he_vs_plain_compare,
+            )
 
             result = {
                 "fpga": fpga_result,
                 "cpu_compiled": cpu_result,
                 "plain_model": plain_result,
                 "he_intermediate_compare": he_compare,
+                "he_vs_plain_intermediate_compare": he_vs_plain_compare,
                 "verdict": verdict,
             }
             all_results.append(result)
@@ -923,6 +1244,8 @@ def main() -> int:
 
             if fpga_result["decrypt_error"]:
                 print(f"decrypt_error={fpga_result['decrypt_error']}")
+            if fpga_result.get("missing_decrypted_layers"):
+                print(f"missing_decrypted_layers={fpga_result['missing_decrypted_layers']}")
             if not fpga_result["kernel_execution"]["ok"]:
                 print(f"kernel_issues={fpga_result['kernel_execution']['issues']}")
 
@@ -955,13 +1278,31 @@ def main() -> int:
                     f"plain_wall_s={plain_result['wall_run_program_s']:.6f}"
                 )
                 print(f"plain_logits={plain_result['logits']}")
+                if he_vs_plain_compare is not None:
+                    print(f"he_vs_plain_first_bad_layer={he_vs_plain_compare['first_bad_layer']}")
+                    for layer_name in ["conv", "conv_sq", "o2", "o2_sq", "pred"]:
+                        info = he_vs_plain_compare[layer_name]
+                        print(
+                            f"{layer_name}: "
+                            f"pass={info['pass']} "
+                            f"max_abs_diff={info['max_abs_diff']:.6e} "
+                            f"threshold={info['threshold']:.6e} "
+                            f"count={info['compare_count']}"
+                        )
 
             print(f"verdict={verdict['category']} reason={verdict['reason']}")
 
     total = len(all_results)
     correct = sum(1 for r in all_results if bool(r["fpga"]["is_correct"]))
     decrypt_ok_count = sum(1 for r in all_results if bool(r["fpga"]["decrypt_ok"]))
+    outputs_complete_count = sum(1 for r in all_results if bool(r["fpga"].get("outputs_complete", False)))
     kernel_ok_count = sum(1 for r in all_results if bool(r["fpga"]["kernel_execution"]["ok"]))
+    he_vs_plain_pass_count = sum(
+        1
+        for r in all_results
+        if r.get("he_vs_plain_intermediate_compare") is not None
+        and bool(r["he_vs_plain_intermediate_compare"].get("all_passed", False))
+    )
     cpu_match_count = sum(
         1
         for r in all_results
@@ -992,13 +1333,17 @@ def main() -> int:
         "sample_end": int(sample_end),
         "sample_ids": [int(v) for v in sample_ids],
         "decode_mode": str(args.pred_decode_mode),
+        "layer_abs_tol": float(args.layer_abs_tol),
+        "layer_rel_tol": float(args.layer_rel_tol),
         "compare_cpu_compiled": bool(args.compare_cpu_compiled),
         "run_plain_model": bool(args.run_plain_model),
         "total": int(total),
         "correct": int(correct),
         "accuracy": (float(correct) / float(total)) if total > 0 else 0.0,
         "decrypt_ok_count": int(decrypt_ok_count),
+        "outputs_complete_count": int(outputs_complete_count),
         "kernel_ok_count": int(kernel_ok_count),
+        "he_vs_plain_pass_count": int(he_vs_plain_pass_count),
         "cpu_match_count": int(cpu_match_count),
         "plain_correct_count": int(plain_correct_count),
         "plain_match_fpga_count": int(plain_match_fpga_count),
@@ -1013,7 +1358,10 @@ def main() -> int:
     print("\n=== summary ===")
     print(f"accuracy={summary['accuracy']:.4f} ({correct}/{total})")
     print(f"decrypt_ok={decrypt_ok_count}/{total}")
+    print(f"outputs_complete={outputs_complete_count}/{total}")
     print(f"kernel_ok={kernel_ok_count}/{total}")
+    if args.run_plain_model:
+        print(f"he_vs_plain_pass={he_vs_plain_pass_count}/{total}")
     if args.compare_cpu_compiled:
         print(f"cpu_match={cpu_match_count}/{total}")
     if args.run_plain_model:

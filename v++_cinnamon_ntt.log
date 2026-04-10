@@ -1,0 +1,70 @@
+INFO: [v++ 60-1306] Additional information associated with this v++ compile can be found at:
+	Reports: /home/CONNECT/xmeng027/work/ScaleOutKeyswitch/CinnamonHLS/build/hw/_tmp_compile_cinnamon_ntt/reports/cinnamon_ntt
+	Log files: /home/CONNECT/xmeng027/work/ScaleOutKeyswitch/CinnamonHLS/build/hw/_tmp_compile_cinnamon_ntt/logs/cinnamon_ntt
+INFO: [v++ 60-1548] Creating build summary session with primary output /home/CONNECT/xmeng027/work/ScaleOutKeyswitch/CinnamonHLS/build/hw/cinnamon_ntt.xo.compile_summary, at Fri Apr 10 14:53:07 2026
+INFO: [v++ 60-1315] Creating rulecheck session with output '/home/CONNECT/xmeng027/work/ScaleOutKeyswitch/CinnamonHLS/build/hw/_tmp_compile_cinnamon_ntt/reports/cinnamon_ntt/v++_compile_cinnamon_ntt_guidance.html', at Fri Apr 10 14:53:08 2026
+INFO: [v++ 60-895]   Target platform: /opt/xilinx/platforms/xilinx_u55c_gen3x16_xdma_3_202210_1/xilinx_u55c_gen3x16_xdma_3_202210_1.xpfm
+INFO: [v++ 60-1578]   This platform contains Xilinx Shell Archive '/opt/xilinx/platforms/xilinx_u55c_gen3x16_xdma_3_202210_1/hw/hw.xsa'
+INFO: [v++ 74-78] Compiler Version string: 2024.1
+INFO: [v++ 60-1302] Platform 'xilinx_u55c_gen3x16_xdma_3_202210_1.xpfm' has been explicitly enabled for this release.
+INFO: [v++ 60-585] Compiling for hardware target
+INFO: [v++ 60-423]   Target device: xilinx_u55c_gen3x16_xdma_3_202210_1
+INFO: [v++ 60-242] Creating kernel: 'cinnamon_ntt'
+INFO: [v++ 60-1616] Creating a HLS clock using kernel_frequency option: 200 MHz
+
+===>The following messages were generated while  performing high-level synthesis for kernel: cinnamon_ntt Log file: /home/CONNECT/xmeng027/work/ScaleOutKeyswitch/CinnamonHLS/build/hw/_tmp_compile_cinnamon_ntt/cinnamon_ntt/cinnamon_ntt/vitis_hls.log :
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_394_1'.
+INFO: [v++ 200-1470] Pipelining result : Target II = 1, Final II = 1, Depth = 141, loop 'VITIS_LOOP_394_1'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_57_2'.
+INFO: [v++ 200-1470] Pipelining result : Target II = NA, Final II = 1, Depth = 1, loop 'VITIS_LOOP_57_2'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_66_3'.
+INFO: [v++ 200-1470] Pipelining result : Target II = 1, Final II = 1, Depth = 17, loop 'VITIS_LOOP_66_3'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_474_1'.
+INFO: [v++ 200-1470] Pipelining result : Target II = 1, Final II = 3, Depth = 3, loop 'VITIS_LOOP_474_1'
+INFO: [v++ 204-61] Pipelining loop 'Loop 1'.
+INFO: [v++ 200-1470] Pipelining result : Target II = NA, Final II = 5, Depth = 5, loop 'Loop 1'
+INFO: [v++ 204-61] Pipelining loop 'Loop 1'.
+INFO: [v++ 200-1470] Pipelining result : Target II = NA, Final II = 4, Depth = 4, loop 'Loop 1'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_139_1'.
+INFO: [v++ 200-1470] Pipelining result : Target II = NA, Final II = 70, Depth = 72, loop 'VITIS_LOOP_139_1'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_627_1'.
+INFO: [v++ 200-1470] Pipelining result : Target II = 1, Final II = 199, Depth = 202, loop 'VITIS_LOOP_627_1'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_120_1'.
+INFO: [v++ 200-1470] Pipelining result : Target II = NA, Final II = 201, Depth = 204, loop 'VITIS_LOOP_120_1'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_559_2'.
+INFO: [v++ 200-1470] Pipelining result : Target II = 1, Final II = 1, Depth = 69, loop 'VITIS_LOOP_559_2'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_564_3'.
+INFO: [v++ 200-1470] Pipelining result : Target II = 1, Final II = 1, Depth = 1, loop 'VITIS_LOOP_564_3'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_574_5'.
+INFO: [v++ 200-1470] Pipelining result : Target II = 1, Final II = 201, Depth = 202, loop 'VITIS_LOOP_574_5'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_583_6_VITIS_LOOP_584_7'.
+INFO: [v++ 200-1470] Pipelining result : Target II = 1, Final II = 1, Depth = 3, loop 'VITIS_LOOP_583_6_VITIS_LOOP_584_7'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_592_9'.
+INFO: [v++ 200-1470] Pipelining result : Target II = 1, Final II = 1, Depth = 2, loop 'VITIS_LOOP_592_9'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_597_10'.
+INFO: [v++ 200-1470] Pipelining result : Target II = 1, Final II = 1, Depth = 1, loop 'VITIS_LOOP_597_10'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_139_1'.
+INFO: [v++ 200-1470] Pipelining result : Target II = NA, Final II = 70, Depth = 72, loop 'VITIS_LOOP_139_1'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_606_11'.
+INFO: [v++ 200-1470] Pipelining result : Target II = 1, Final II = 1, Depth = 203, loop 'VITIS_LOOP_606_11'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_639_2'.
+INFO: [v++ 200-1470] Pipelining result : Target II = 1, Final II = 199, Depth = 202, loop 'VITIS_LOOP_639_2'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_74_4'.
+INFO: [v++ 200-1470] Pipelining result : Target II = 1, Final II = 1, Depth = 69, loop 'VITIS_LOOP_74_4'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_324_1'.
+INFO: [v++ 200-1470] Pipelining result : Target II = 1, Final II = 1, Depth = 8, loop 'VITIS_LOOP_324_1'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_364_1'.
+INFO: [v++ 200-1470] Pipelining result : Target II = 1, Final II = 1, Depth = 3, loop 'VITIS_LOOP_364_1'
+INFO: [v++ 204-61] Pipelining loop 'VITIS_LOOP_368_2'.
+INFO: [v++ 200-1470] Pipelining result : Target II = 1, Final II = 1, Depth = 3, loop 'VITIS_LOOP_368_2'
+INFO: [v++ 200-790] **** Loop Constraint Status: All loop constraints were NOT satisfied.
+INFO: [v++ 200-789] **** Estimated Fmax: 204.54 MHz
+INFO: [v++ 60-594] Finished kernel compilation
+INFO: [v++ 60-244] Generating system estimate report...
+INFO: [v++ 60-1092] Generated system estimate report: /home/CONNECT/xmeng027/work/ScaleOutKeyswitch/CinnamonHLS/build/hw/_tmp_compile_cinnamon_ntt/reports/cinnamon_ntt/system_estimate_cinnamon_ntt.xtxt
+WARNING: [v++ 17-1525] IP definition with the same IP name already exists in XO container. Will overwrite the existing IP definition.
+INFO: [v++ 60-586] Created /home/CONNECT/xmeng027/work/ScaleOutKeyswitch/CinnamonHLS/build/hw/cinnamon_ntt.xo
+INFO: [v++ 60-2343] Use the Vitis Unified IDE to visualize and navigate the reports. Run the following command. 
+    vitis -a/ --analyze /home/CONNECT/xmeng027/work/ScaleOutKeyswitch/CinnamonHLS/build/hw/cinnamon_ntt.xo.compile_summary 
+INFO: [v++ 60-791] Total elapsed time: 0h 1m 58s
+INFO: [v++ 60-1653] Closing dispatch client.
