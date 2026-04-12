@@ -13,6 +13,7 @@ from cinnamon_fpga.parser import (
     expected_kernel_checksum,
     load_instruction_streams,
     parse_program_inputs,
+    segment_stream_by_contiguous_module,
     summarize_opcodes,
 )
 
@@ -120,6 +121,36 @@ syn @ 1:1 :
     assert len(buckets["base_conv"].instruction_words) == 4
     assert len(buckets["transpose"].instruction_words) == 0
     assert len(buckets["host_comm"].instruction_words) == 4
+
+
+def test_segment_stream_by_contiguous_module_preserves_execution_order(tmp_path: pathlib.Path) -> None:
+    instructions = tmp_path / "instructions0"
+    instructions.write_text(
+        """Instruction Stream 0:
+load r0: i1(0){F}
+load r1: i3(0){F}
+add r2: r0[X], r1[X] | 0
+store r2[X]: v5(0)
+load r3: i1(1){F}
+add r4: r3[X], r3[X] | 1
+store r4[X]: v5(1)
+""",
+        encoding="utf-8",
+    )
+    stream = parse_instruction_file(instructions, partition_id=0)
+    segments = segment_stream_by_contiguous_module(stream)
+    assert [segment.module for segment in segments] == [
+        "memory",
+        "arithmetic",
+        "memory",
+        "arithmetic",
+        "memory",
+    ]
+    assert [len(segment.lines) for segment in segments] == [2, 1, 2, 1, 1]
+    assert segments[0].start_instruction == 0
+    assert segments[0].end_instruction == 2
+    assert segments[1].lines == ["add r2: r0[X], r1[X] | 0"]
+    assert segments[2].lines == ["store r2[X]: v5(0)", "load r3: i1(1){F}"]
 
 
 def test_extended_isa_syntax_parses_without_fallback(tmp_path: pathlib.Path) -> None:

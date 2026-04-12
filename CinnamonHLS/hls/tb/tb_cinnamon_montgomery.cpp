@@ -1,16 +1,20 @@
 #include <cstdint>
+#include <iostream>
 
 extern "C" void cinnamon_montgomery(const std::uint64_t *instructions,
-                                     const std::uint64_t *inputs,
-                                     std::uint64_t *outputs,
-                                     std::uint32_t instruction_count,
-                                     std::uint32_t input_count,
-                                     std::uint32_t output_count,
-                                     std::uint32_t partition_id);
+                                    std::uint64_t *control_words,
+                                    std::uint64_t *payload_words,
+                                    std::uint64_t *outputs,
+                                    std::uint32_t instruction_count,
+                                    std::uint32_t control_count,
+                                    std::uint32_t payload_count,
+                                    std::uint32_t output_count,
+                                    std::uint32_t partition_id);
 
 namespace {
-constexpr std::uint64_t kInputMagic = 0x43494E4E414D4F4EULL;
-constexpr std::uint32_t kHeaderWords = 6U;
+constexpr std::uint64_t kPayloadMagic = 0x43494E4E5041594CULL;
+constexpr std::uint64_t kPayloadVersion = 1ULL;
+constexpr std::uint32_t kOutputHeaderWords = 6U;
 constexpr std::uint32_t kAxiDepth = 4096U;
 
 std::uint64_t encode_word0(std::uint32_t opcode, std::uint32_t dst,
@@ -35,26 +39,71 @@ std::uint64_t encode_word1(std::int32_t imm0, std::int32_t imm1) {
 
 int main() {
   constexpr std::uint64_t q = 268042241ULL;
-  constexpr std::uint32_t reg_count = 3U;
-  constexpr std::uint32_t input_words = 6U;
-  constexpr std::uint32_t instruction_words = 4U;
-  std::uint64_t inputs[kAxiDepth] = {kInputMagic, reg_count, q, 34234ULL, 7652ULL, 0ULL};
+  constexpr std::uint64_t expected_product = 261958568ULL;
+  constexpr std::uint32_t register_count = 3U;
+  constexpr std::uint32_t coeff_count = 1U;
+  constexpr std::uint32_t rns_count = 1U;
+  constexpr std::uint32_t handle_count = 2U;
+  constexpr std::uint32_t handle_capacity = 4U;
+  constexpr std::uint32_t control_count =
+      9U + (rns_count * 2U) + register_count + (handle_capacity * 2U);
+  constexpr std::uint32_t payload_count = handle_capacity * coeff_count;
+  constexpr std::uint32_t output_count = kOutputHeaderWords + register_count;
+
+  std::uint64_t control_words[kAxiDepth] = {};
+  control_words[0] = kPayloadMagic;
+  control_words[1] = kPayloadVersion;
+  control_words[2] = register_count;
+  control_words[3] = coeff_count;
+  control_words[4] = rns_count;
+  control_words[5] = handle_count;
+  control_words[6] = handle_capacity;
+  control_words[7] = 0U;
+  control_words[8] = 0U;
+  control_words[9] = 0U;
+  control_words[10] = q;
+  control_words[11] = 1U;
+  control_words[12] = 2U;
+  control_words[14] = 0U;
+  control_words[15] = 0U;
+  control_words[16] = 0U;
+  control_words[17] = 0U;
+
+  std::uint64_t payload_words[kAxiDepth] = {};
+  payload_words[0] = 34234ULL;
+  payload_words[1] = 7652ULL;
+
   std::uint64_t instructions[kAxiDepth] = {
       encode_word0(6U, 2U, 0U, 1U, 0U, 0U), encode_word1(0, 0), 0ULL, 0ULL,
   };
   std::uint64_t outputs[kAxiDepth] = {};
 
-  cinnamon_montgomery(
-      instructions, inputs, outputs,
-      instruction_words,
-      input_words,
-      static_cast<std::uint32_t>(kHeaderWords + reg_count), 0U);
+  cinnamon_montgomery(instructions, control_words, payload_words, outputs, 4U,
+                      control_count, payload_count, output_count, 0U);
 
   if (outputs[0] != 0ULL) {
+    std::cerr << "montgomery status mismatch: outputs[0]=" << outputs[0] << '\n';
     return 1;
   }
-  if (outputs[kHeaderWords + 2] != 228895654ULL) {
+  if (outputs[1] != 1ULL) {
+    std::cerr << "montgomery executed mismatch: expected 1 got " << outputs[1]
+              << '\n';
     return 2;
+  }
+  if (outputs[kOutputHeaderWords + 2U] != 3ULL) {
+    std::cerr << "montgomery dst handle mismatch: expected 3 got "
+              << outputs[kOutputHeaderWords + 2U] << '\n';
+    return 3;
+  }
+  if (control_words[5] != 3ULL) {
+    std::cerr << "montgomery handle count mismatch: expected 3 got "
+              << control_words[5] << '\n';
+    return 4;
+  }
+  if (payload_words[2] != expected_product) {
+    std::cerr << "montgomery payload mismatch: expected " << expected_product
+              << " got " << payload_words[2] << '\n';
+    return 5;
   }
   return 0;
 }

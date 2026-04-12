@@ -810,11 +810,14 @@ def run_one_sample_fpga_only(
     decrypted_outputs: Dict[str, Any] = {}
     pred_values: List[Any] = []
     missing_decrypted_layers: List[str] = list(_EXPECTED_HE_OUTPUT_LAYERS)
+    prediction_source = "fpga_payload_plus_cpu_decrypt"
+    pred_compare_available = False
 
     try:
         decrypted_outputs = dict(runtime.get_decrypted_outputs(encryptor, output_scales))
         pred_values = list(decrypted_outputs.get("pred", []))
         decrypt_ok = True
+        pred_compare_available = True
         missing_decrypted_layers = _missing_expected_layers(decrypted_outputs)
     except Exception as exc:
         decrypt_ok = False
@@ -834,6 +837,8 @@ def run_one_sample_fpga_only(
         "pred_label": int(pred_label) if pred_label is not None else None,
         "pred_valid": bool(pred_valid),
         "is_correct": bool(is_correct),
+        "pred_compare_available": bool(pred_compare_available),
+        "prediction_source": str(prediction_source),
         "decrypt_ok": bool(decrypt_ok),
         "decrypt_error": str(decrypt_error),
         "expected_output_layers": [str(v) for v in _EXPECTED_HE_OUTPUT_LAYERS],
@@ -1232,15 +1237,26 @@ def main() -> int:
             }
             all_results.append(result)
 
-            print(
-                f"label={fpga_result['label']} "
-                f"fpga_pred={fpga_result['pred_label']} "
-                f"fpga_correct={fpga_result['is_correct']} "
-                f"decrypt_ok={fpga_result['decrypt_ok']} "
-                f"kernel_ok={fpga_result['kernel_execution']['ok']} "
-                f"wall_run_program_s={fpga_result['wall_run_program_s']:.6f}"
-            )
-            print(f"fpga_pred_key_values={fpga_result['pred_key_values']}")
+            if fpga_result.get("pred_compare_available", True):
+                print(
+                    f"label={fpga_result['label']} "
+                    f"fpga_pred={fpga_result['pred_label']} "
+                    f"fpga_correct={fpga_result['is_correct']} "
+                    f"decrypt_ok={fpga_result['decrypt_ok']} "
+                    f"kernel_ok={fpga_result['kernel_execution']['ok']} "
+                    f"wall_run_program_s={fpga_result['wall_run_program_s']:.6f}"
+                )
+                print(f"fpga_pred_key_values={fpga_result['pred_key_values']}")
+            else:
+                print(
+                    f"label={fpga_result['label']} "
+                    f"fpga_pred=n/a "
+                    f"fpga_correct=n/a "
+                    f"decrypt_ok={fpga_result['decrypt_ok']} "
+                    f"kernel_ok={fpga_result['kernel_execution']['ok']} "
+                    f"wall_run_program_s={fpga_result['wall_run_program_s']:.6f}"
+                )
+                print(f"prediction_source={fpga_result['prediction_source']}")
 
             if fpga_result["decrypt_error"]:
                 print(f"decrypt_error={fpga_result['decrypt_error']}")
@@ -1294,6 +1310,9 @@ def main() -> int:
 
     total = len(all_results)
     correct = sum(1 for r in all_results if bool(r["fpga"]["is_correct"]))
+    pred_available_count = sum(
+        1 for r in all_results if bool(r["fpga"].get("pred_compare_available", True))
+    )
     decrypt_ok_count = sum(1 for r in all_results if bool(r["fpga"]["decrypt_ok"]))
     outputs_complete_count = sum(1 for r in all_results if bool(r["fpga"].get("outputs_complete", False)))
     kernel_ok_count = sum(1 for r in all_results if bool(r["fpga"]["kernel_execution"]["ok"]))
@@ -1339,7 +1358,8 @@ def main() -> int:
         "run_plain_model": bool(args.run_plain_model),
         "total": int(total),
         "correct": int(correct),
-        "accuracy": (float(correct) / float(total)) if total > 0 else 0.0,
+        "pred_available_count": int(pred_available_count),
+        "accuracy": (float(correct) / float(total)) if total > 0 and pred_available_count == total else None,
         "decrypt_ok_count": int(decrypt_ok_count),
         "outputs_complete_count": int(outputs_complete_count),
         "kernel_ok_count": int(kernel_ok_count),
@@ -1356,7 +1376,11 @@ def main() -> int:
     out_json.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     print("\n=== summary ===")
-    print(f"accuracy={summary['accuracy']:.4f} ({correct}/{total})")
+    if summary["accuracy"] is None:
+        print(f"accuracy=n/a (pred unavailable for {total - pred_available_count}/{total} cases)")
+    else:
+        print(f"accuracy={summary['accuracy']:.4f} ({correct}/{total})")
+    print(f"pred_available={pred_available_count}/{total}")
     print(f"decrypt_ok={decrypt_ok_count}/{total}")
     print(f"outputs_complete={outputs_complete_count}/{total}")
     print(f"kernel_ok={kernel_ok_count}/{total}")

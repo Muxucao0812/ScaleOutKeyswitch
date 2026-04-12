@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import pathlib
+import sys
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Sequence
@@ -144,7 +145,9 @@ def compare_vectors(actual: Sequence[Any], expected: Sequence[float], tolerance:
     bad = []
     for i, (a, e) in enumerate(zip(actual, expected)):
         a_real = to_real(a)
-        err = abs(a_real - e)
+        err = abs(a_real - e) if math.isfinite(a_real) else float("inf")
+        if not math.isfinite(err):
+            err = float("inf")
         max_error = max(max_error, err)
         if err > tolerance:
             bad.append((i, a_real, e, err))
@@ -268,7 +271,7 @@ def benchmark_one_size(
         xclbin_path=ROOT_DIR / "build" / "sw_emu" / "cinnamon_fpga.sw_emu.xclbin",
         board_indices=[0],
         require_kernel_execution=True,
-        verify_kernel_results=True,
+        verify_kernel_results=False,
     )
 
     runtime.generate_and_serialize_evalkeys(evalkeys, program_inputs, encryptor)
@@ -280,18 +283,18 @@ def benchmark_one_size(
 
     dispatch = cinnamon_fpga.describe_last_dispatch(runtime)
     kernel_outputs = runtime.get_kernel_outputs()
-
-    cpu = cinnamon_emulator.Emulator(context)
-    cpu.generate_and_serialize_evalkeys(evalkeys, program_inputs, encryptor)
-    cpu.generate_inputs(program_inputs, evalkeys, raw_inputs, encryptor)
-    cpu.run_program(instructions_base, num_chips, register_file_size)
+    output_ciphertexts = runtime.get_output_ciphertexts()
+    output_sources = {
+        name: str(payload.get("source", "unknown"))
+        for name, payload in output_ciphertexts.items()
+    }
 
     # One rescale after plaintext*ciphertext accumulation
     output_scales = {
         "y": float((scale * scale) / PRIMES[LEVEL - 1])
     }
 
-    decrypted = cpu.get_decrypted_outputs(encryptor, output_scales)
+    decrypted = runtime.get_decrypted_outputs(encryptor, output_scales)
     he_values = list(decrypted.get("y", []))[:n]
     plain_values = run_plain_reference(matrix, vector).tolist()
 
@@ -311,10 +314,12 @@ def benchmark_one_size(
         "first_bad": bad[:10],
         "dispatch": dispatch,
         "kernel_outputs": kernel_outputs,
+        "output_ciphertexts": output_ciphertexts,
+        "output_sources": output_sources,
     }
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Dense square BSGS matvec benchmark using sw_emu"
     )
@@ -333,6 +338,11 @@ def main() -> None:
     parser.add_argument("--register-file-size", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tolerance", type=float, default=1e-3)
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Exit immediately when one size produces a mismatch.",
+    )
     parser.add_argument(
         "--work-root",
         type=pathlib.Path,
@@ -369,6 +379,9 @@ def main() -> None:
         print(f"pass            = {result['pass']}")
         print(f"plain_preview   = {result['plain_preview']}")
         print(f"he_preview_real = {result['he_preview_real']}")
+        if not result["pass"] and args.fail_fast:
+            print("\nFAIL: stopping matmul benchmark after first mismatch.")
+            return 1
 
     report = {
         "generated_at": datetime.now().isoformat(),
@@ -384,7 +397,12 @@ def main() -> None:
     report_path = args.work_root / f"report_{args.case}.json"
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(f"\nReport written to: {report_path}")
+    if any(not result["pass"] for result in all_results):
+        print("\nFAIL: one or more matmul sizes did not match the reference.")
+        return 1
+    print("\nPASS: all matmul sizes matched the reference.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

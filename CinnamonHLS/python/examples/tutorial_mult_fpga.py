@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import pathlib
+import sys
 
 import cinnamon_emulator
 import cinnamon_fpga
@@ -56,7 +58,9 @@ def compare_vectors(actual, expected, tolerance: float = 1e-2):
 
     for i, (a, e) in enumerate(zip(actual, expected)):
         a_real = to_real(a)
-        error = abs(a_real - e)
+        error = abs(a_real - e) if math.isfinite(a_real) else float("inf")
+        if not math.isfinite(error):
+            error = float("inf")
         max_error = max(max_error, error)
         if error > tolerance:
             bad.append((i, a_real, e, error))
@@ -64,7 +68,7 @@ def compare_vectors(actual, expected, tolerance: float = 1e-2):
     return max_error, bad
 
 
-def main() -> None:
+def main() -> int:
     out_dir = ROOT_DIR / "build" / "cinnamon_tutorial_mul_fpga"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -119,7 +123,7 @@ def main() -> None:
         xclbin_path=ROOT_DIR / "build" / "sw_emu" / "cinnamon_fpga.sw_emu.xclbin",
         board_indices=[0],
         require_kernel_execution=True,
-        verify_kernel_results=True,
+        verify_kernel_results=False,
     )
 
     runtime.generate_and_serialize_evalkeys(
@@ -141,29 +145,18 @@ def main() -> None:
 
     print("dispatch:", cinnamon_fpga.describe_last_dispatch(runtime))
     print("kernel outputs:", runtime.get_kernel_outputs())
+    output_ciphertexts = runtime.get_output_ciphertexts()
+    print("output ciphertexts:", output_ciphertexts)
+    output_sources = {
+        name: str(payload.get("source", "unknown"))
+        for name, payload in output_ciphertexts.items()
+    }
+    print("output sources:", output_sources)
 
     # -------------------------------------------------
-    # Use CPU emulator to decrypt program outputs
+    # Decrypt through FPGA payload outputs + CPU decrypt path.
     # -------------------------------------------------
-    cpu = cinnamon_emulator.Emulator(context)
-    cpu.generate_and_serialize_evalkeys(
-        str(out_dir / "evalkeys"),
-        str(out_dir / "program_inputs"),
-        encryptor,
-    )
-    cpu.generate_inputs(
-        str(out_dir / "program_inputs"),
-        str(out_dir / "evalkeys"),
-        raw_inputs,
-        encryptor,
-    )
-    cpu.run_program(
-        str(out_dir / "instructions"),
-        num_chips,
-        register_file_size,
-    )
-
-    decrypted = cpu.get_decrypted_outputs(encryptor, output_scales)
+    decrypted = runtime.get_decrypted_outputs(encryptor, output_scales)
     z_values = list(decrypted.get("z", []))
 
     print("\ndecrypted z first 16:")
@@ -176,7 +169,9 @@ def main() -> None:
     for i, (a, e) in enumerate(zip(z_values[:16], expected[:16])):
         a_real = to_real(a)
         a_imag = to_imag(a)
-        err = abs(a_real - e)
+        err = abs(a_real - e) if math.isfinite(a_real) else float("inf")
+        if not math.isfinite(err):
+            err = float("inf")
         print(
             f"idx={i:2d}  actual={a_real:.9f}  imag={a_imag:.3e}  "
             f"expected={e:.1f}  err={err:.3e}"
@@ -194,9 +189,11 @@ def main() -> None:
                 f"idx={idx:2d}  actual={actual:.9f}  expected={exp:.1f}  err={err:.3e}"
             )
         print("\nFAIL: multiplication result does not match expected values.")
+        return 1
     else:
         print("\nPASS: multiplication result matches expected values.")
+        return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -38,6 +38,11 @@ add_executable(test_base_conv tests/test_base_conv.cpp)
 target_link_libraries(test_base_conv PRIVATE cinnamon_hls)
 add_test(NAME cinnamon_hls_base_conv COMMAND test_base_conv)
 
+add_executable(test_payload_runtime_helpers tests/test_payload_runtime_helpers.cpp)
+target_include_directories(test_payload_runtime_helpers PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/kernels)
+target_link_libraries(test_payload_runtime_helpers PRIVATE cinnamon_hls)
+add_test(NAME cinnamon_hls_payload_runtime_helpers COMMAND test_payload_runtime_helpers)
+
 add_executable(
     test_base_conv_kernels
     tests/test_base_conv_kernels.cpp

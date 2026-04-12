@@ -26,6 +26,7 @@ from .parser import (
     module_kernels,
     module_order,
     parse_program_inputs,
+    segment_stream_by_contiguous_module,
     split_stream_by_module,
     summarize_opcodes,
 )
@@ -50,6 +51,7 @@ __all__ = [
     "module_kernels",
     "module_order",
     "parse_program_inputs",
+    "segment_stream_by_contiguous_module",
     "split_stream_by_module",
     "summarize_opcodes",
     "compare_case",

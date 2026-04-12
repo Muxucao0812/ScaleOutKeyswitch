@@ -23,6 +23,10 @@ class PartitionDispatchResult:
     instruction_count: int
     input_count: int
     output_words: List[int]
+    control_count: int = 0
+    payload_count: int = 0
+    control_words: List[int] = dataclasses.field(default_factory=list)
+    payload_words: List[int] = dataclasses.field(default_factory=list)
     setup_s: float = 0.0
     h2d_s: float = 0.0
     wait_s: float = 0.0
@@ -36,6 +40,7 @@ class DispatchConfig:
     kernel_name: str
     output_word_count: int = 16
     word_alignment: int = 1
+    abi: str = "legacy"
 
 
 @dataclasses.dataclass
@@ -64,10 +69,26 @@ class _BoBundle:
     last_inp_payload: bytes = b""
 
 
+@dataclasses.dataclass
+class _PayloadBoBundle:
+    inst_bo: Any
+    ctl_bo: Any
+    pay_bo: Any
+    out_bo: Any
+    inst_size: int
+    ctl_size: int
+    pay_size: int
+    out_size: int
+    last_inst_payload: bytes = b""
+    last_ctl_payload: bytes = b""
+    last_pay_payload: bytes = b""
+
+
 _KERNEL_CACHE_LOCK = threading.Lock()
 _DEVICE_CACHE: Dict[Tuple[int, str], _DeviceHandle] = {}
 _KERNEL_CACHE: Dict[Tuple[int, str, str], _KernelHandle] = {}
 _BO_CACHE: Dict[Tuple[int, str, str, int], _BoBundle] = {}
+_PAYLOAD_BO_CACHE: Dict[Tuple[int, str, str, int], _PayloadBoBundle] = {}
 _JSONL_ENV = "CINNAMON_FPGA_JSONL_LOG"
 _JSONL_DEBUG_ENV = "CINNAMON_FPGA_JSONL_DEBUG_LOG"
 _JSONL_DEBUG_FLAG_ENV = "CINNAMON_FPGA_JSONL_DEBUG"
@@ -241,6 +262,51 @@ def _resolve_bo_bundle(
     return bundle
 
 
+def _resolve_payload_bo_bundle(
+    *,
+    handle: _KernelHandle,
+    board_index: int,
+    config: DispatchConfig,
+    partition_id: int,
+    inst_size: int,
+    ctl_size: int,
+    pay_size: int,
+    out_size: int,
+) -> _PayloadBoBundle:
+    cache_key = (
+        int(board_index),
+        str(config.xclbin_path.resolve()),
+        str(config.kernel_name),
+        int(partition_id),
+    )
+    with _KERNEL_CACHE_LOCK:
+        bundle = _PAYLOAD_BO_CACHE.get(cache_key)
+
+    needs_realloc = (
+        bundle is None
+        or bundle.inst_size != inst_size
+        or bundle.ctl_size != ctl_size
+        or bundle.pay_size != pay_size
+        or bundle.out_size != out_size
+    )
+    if needs_realloc:
+        kernel = handle.kernel
+        pyxrt = handle.pyxrt
+        bundle = _PayloadBoBundle(
+            inst_bo=pyxrt.bo(handle.device, inst_size, pyxrt.bo.normal, kernel.group_id(0)),
+            ctl_bo=pyxrt.bo(handle.device, ctl_size, pyxrt.bo.normal, kernel.group_id(1)),
+            pay_bo=pyxrt.bo(handle.device, pay_size, pyxrt.bo.normal, kernel.group_id(2)),
+            out_bo=pyxrt.bo(handle.device, out_size, pyxrt.bo.normal, kernel.group_id(3)),
+            inst_size=inst_size,
+            ctl_size=ctl_size,
+            pay_size=pay_size,
+            out_size=out_size,
+        )
+        with _KERNEL_CACHE_LOCK:
+            _PAYLOAD_BO_CACHE[cache_key] = bundle
+    return bundle
+
+
 def _write_if_changed(
     *,
     bo: Any,
@@ -369,6 +435,159 @@ def run_partition_dispatch(
         instruction_count=len(instruction_words),
         input_count=len(input_words),
         output_words=output_words,
+        setup_s=t_setup_done - t_begin,
+        h2d_s=t_h2d_done - t_setup_done,
+        wait_s=t_wait_done - t_wait_begin,
+        d2h_s=t_done - t_wait_done,
+        total_s=t_done - t_begin,
+    )
+
+
+def run_payload_partition_dispatch(
+    config: DispatchConfig,
+    board_index: int,
+    partition_id: int,
+    instruction_words: Sequence[int],
+    control_words: Sequence[int],
+    payload_words: Sequence[int],
+) -> PartitionDispatchResult:
+    t_begin = time.perf_counter()
+    handle = _resolve_kernel_handle(config, board_index)
+    pyxrt = handle.pyxrt
+    kernel = handle.kernel
+    t_setup_done = time.perf_counter()
+
+    word_alignment = max(int(config.word_alignment), 1)
+    instructions_packed = _pack_words(instruction_words, alignment_words=word_alignment)
+    control_packed = _pack_words(control_words, alignment_words=word_alignment)
+    payload_packed = _pack_words(payload_words, alignment_words=word_alignment)
+    output_words_count = max(config.output_word_count, 1)
+    padded_output_words = output_words_count
+    if word_alignment > 1:
+        remainder = padded_output_words % word_alignment
+        if remainder != 0:
+            padded_output_words += word_alignment - remainder
+    outputs_packed_size = padded_output_words * 8
+    bundle = _resolve_payload_bo_bundle(
+        handle=handle,
+        board_index=board_index,
+        config=config,
+        partition_id=partition_id,
+        inst_size=len(instructions_packed),
+        ctl_size=len(control_packed),
+        pay_size=len(payload_packed),
+        out_size=outputs_packed_size,
+    )
+
+    bundle.last_inst_payload = _write_if_changed(
+        bo=bundle.inst_bo,
+        payload=instructions_packed,
+        previous=bundle.last_inst_payload,
+        pyxrt=pyxrt,
+    )
+    bundle.last_ctl_payload = _write_if_changed(
+        bo=bundle.ctl_bo,
+        payload=control_packed,
+        previous=bundle.last_ctl_payload,
+        pyxrt=pyxrt,
+    )
+    bundle.last_pay_payload = _write_if_changed(
+        bo=bundle.pay_bo,
+        payload=payload_packed,
+        previous=bundle.last_pay_payload,
+        pyxrt=pyxrt,
+    )
+    t_h2d_done = time.perf_counter()
+
+    run = kernel(
+        bundle.inst_bo,
+        bundle.ctl_bo,
+        bundle.pay_bo,
+        bundle.out_bo,
+        len(instruction_words),
+        len(control_words),
+        len(payload_words),
+        output_words_count,
+        partition_id,
+    )
+    t_wait_begin = time.perf_counter()
+    run.wait()
+    t_wait_done = time.perf_counter()
+
+    bundle.ctl_bo.sync(
+        pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE,
+        len(control_packed),
+        0,
+    )
+    bundle.pay_bo.sync(
+        pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE,
+        len(payload_packed),
+        0,
+    )
+    bundle.out_bo.sync(
+        pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE,
+        outputs_packed_size,
+        0,
+    )
+
+    mapped_ctl = bundle.ctl_bo.map()
+    mapped_pay = bundle.pay_bo.map()
+    mapped_out = bundle.out_bo.map()
+    control_raw = bytes(mapped_ctl[: len(control_packed)])
+    payload_raw = bytes(mapped_pay[: len(payload_packed)])
+    output_raw = bytes(mapped_out[:outputs_packed_size])
+    updated_control_words = _unpack_words(control_raw)[: len(control_words)]
+    updated_payload_words = _unpack_words(payload_raw)[: len(payload_words)]
+    output_words = _unpack_words(output_raw)[:output_words_count]
+    t_done = time.perf_counter()
+
+    _emit_jsonl(
+        "pyxrt.run_payload_partition_dispatch",
+        payload={
+            "card_id": int(board_index),
+            "partition_id": int(partition_id),
+            "kernel_name": str(config.kernel_name),
+            "instruction_count": int(len(instruction_words)),
+            "control_count": int(len(control_words)),
+            "payload_count": int(len(payload_words)),
+            "output_count": int(output_words_count),
+            "kernel_status": int(output_words[0]) if len(output_words) > 0 else None,
+            "kernel_executed": int(output_words[1]) if len(output_words) > 1 else None,
+            "kernel_register_count": int(output_words[2]) if len(output_words) > 2 else None,
+            "kernel_module_id": int(output_words[3]) if len(output_words) > 3 else None,
+            "kernel_partition_id": int(output_words[4]) if len(output_words) > 4 else None,
+            "kernel_trace_acc": int(output_words[5]) if len(output_words) > 5 else None,
+            "setup_s": float(t_setup_done - t_begin),
+            "h2d_s": float(t_h2d_done - t_setup_done),
+            "wait_s": float(t_wait_done - t_wait_begin),
+            "d2h_s": float(t_done - t_wait_done),
+            "partition_total_s": float(t_done - t_begin),
+        },
+        debug_payload={
+            "raw_instruction_preview": [
+                int(word) for word in instruction_words[:_DEBUG_PREVIEW_WORDS]
+            ],
+            "raw_control_preview": [
+                int(word) for word in control_words[:_DEBUG_PREVIEW_WORDS]
+            ],
+            "raw_payload_preview": [
+                int(word) for word in payload_words[:_DEBUG_PREVIEW_WORDS]
+            ],
+            "raw_output_preview": [int(word) for word in output_words[:_DEBUG_PREVIEW_WORDS]],
+        },
+    )
+
+    return PartitionDispatchResult(
+        kernel_name=config.kernel_name,
+        partition_id=partition_id,
+        board_index=board_index,
+        instruction_count=len(instruction_words),
+        input_count=len(control_words),
+        output_words=output_words,
+        control_count=len(control_words),
+        payload_count=len(payload_words),
+        control_words=updated_control_words,
+        payload_words=updated_payload_words,
         setup_s=t_setup_done - t_begin,
         h2d_s=t_h2d_done - t_setup_done,
         wait_s=t_wait_done - t_wait_begin,

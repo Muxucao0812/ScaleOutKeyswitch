@@ -230,6 +230,16 @@ class ModuleInstructionBucket:
 
 
 @dataclasses.dataclass(frozen=True)
+class InstructionSegment:
+    module: str
+    start_instruction: int
+    end_instruction: int
+    lines: List[str]
+    instruction_words: List[int]
+    opcode_counts: Dict[str, int]
+
+
+@dataclasses.dataclass(frozen=True)
 class DecodedInstruction:
     opcode: int
     dst: int
@@ -874,6 +884,61 @@ def split_stream_by_module(stream: InstructionStream) -> Dict[str, ModuleInstruc
             opcode_counts=dict(raw_counts[module_name]),
         )
     return buckets
+
+
+def segment_stream_by_contiguous_module(stream: InstructionStream) -> List[InstructionSegment]:
+    if len(stream.words) != len(stream.lines) * _INSTRUCTION_WORD_STRIDE:
+        raise ValueError(
+            f"encoded instruction words do not match line count for {stream.path}: "
+            f"{len(stream.words)} words vs {len(stream.lines)} lines"
+        )
+
+    segments: List[InstructionSegment] = []
+    current_module: str | None = None
+    current_start = 0
+    current_lines: List[str] = []
+    current_words: List[int] = []
+    current_counts: collections.Counter[str] = collections.Counter()
+
+    def flush(end_instruction: int) -> None:
+        nonlocal current_module, current_start, current_lines, current_words, current_counts
+        if current_module is None:
+            return
+        segments.append(
+            InstructionSegment(
+                module=current_module,
+                start_instruction=current_start,
+                end_instruction=end_instruction,
+                lines=list(current_lines),
+                instruction_words=list(current_words),
+                opcode_counts=dict(current_counts),
+            )
+        )
+        current_module = None
+        current_lines = []
+        current_words = []
+        current_counts = collections.Counter()
+
+    for idx, line in enumerate(stream.lines):
+        opcode = extract_opcode(line)
+        module = module_for_opcode(opcode)
+        start = idx * _INSTRUCTION_WORD_STRIDE
+        words = stream.words[start : start + _INSTRUCTION_WORD_STRIDE]
+
+        if current_module is None:
+            current_module = module
+            current_start = idx
+        elif current_module != module:
+            flush(idx)
+            current_module = module
+            current_start = idx
+
+        current_lines.append(line)
+        current_words.extend(words)
+        current_counts[opcode] += 1
+
+    flush(len(stream.lines))
+    return segments
 
 
 def _rotl64(value: int, shift: int) -> int:

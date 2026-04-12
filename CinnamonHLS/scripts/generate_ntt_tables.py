@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+from math import gcd
 from typing import Dict, List, Sequence
 
 # Tutorial3 CKKS primes (CinnamonTutorial/notebook3/mnist_io.py) plus legacy NTT
@@ -79,7 +80,7 @@ _KNOWN_MODULI: Sequence[int] = (
     268042241,
 )
 
-_SUPPORTED_SPANS: Sequence[int] = (2, 4, 8, 16, 32, 64)
+_SUPPORTED_SPANS: Sequence[int] = (2, 4, 8, 16, 32, 64, 128)
 
 
 def _prime_factors(n: int) -> List[int]:
@@ -125,6 +126,19 @@ def _primitive_root(mod: int) -> int:
     raise ValueError(f"failed to find primitive root for modulus {mod}")
 
 
+def _minimal_primitive_root(order: int, mod: int, generator: int) -> int:
+    if order <= 1:
+        raise ValueError(f"invalid order {order}")
+    phi = mod - 1
+    if phi % order != 0:
+        raise ValueError(f"order {order} does not divide modulus-1 for {mod}")
+    base = pow(generator, phi // order, mod)
+    candidates = [pow(base, k, mod) for k in range(1, order) if gcd(k, order) == 1]
+    if not candidates:
+        raise ValueError(f"no primitive roots found for order={order}, modulus={mod}")
+    return min(candidates)
+
+
 def _build_entries() -> List[Dict[str, int]]:
     entries: List[Dict[str, int]] = []
     for mod in sorted(set(int(v) for v in _KNOWN_MODULI)):
@@ -133,7 +147,7 @@ def _build_entries() -> List[Dict[str, int]]:
         for span in _SUPPORTED_SPANS:
             if phi % (2 * span) != 0:
                 continue
-            psi = pow(generator, phi // (2 * span), mod)
+            psi = _minimal_primitive_root(2 * span, mod, generator)
             if pow(psi, span, mod) != (mod - 1):
                 continue
             psi_inv = _mod_inv(psi, mod)

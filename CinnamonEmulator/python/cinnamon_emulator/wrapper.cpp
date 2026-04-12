@@ -5,7 +5,10 @@
 #include <pybind11/stl.h>
 
 #include <complex>
+#include <cstdint>
 #include <iostream>
+#include <tuple>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -20,6 +23,9 @@
 using namespace Cinnamon::Emulator;
 namespace py = pybind11;
 
+using SerializedLimb =
+    std::tuple<std::uint64_t, bool, std::vector<std::uint32_t>>;
+
 PYBIND11_MODULE(_cinnamon_emulator, m) {
     m.attr("__name__") = "cinnamon_emulator._cinnamon_emulator";
 
@@ -33,7 +39,17 @@ PYBIND11_MODULE(_cinnamon_emulator, m) {
         .def(py::init([](const size_t slots, const std::vector<std::uint64_t> &rns_modulii) {
             return std::unique_ptr<Cinnamon::Emulator::Context>(new Cinnamon::Emulator::Context(slots, rns_modulii));
         }))
-        .def_property_readonly("coeff_count", &Cinnamon::Emulator::Context::n);
+        .def_property_readonly("slots", &Cinnamon::Emulator::Context::slots)
+        .def_property_readonly("coeff_count", &Cinnamon::Emulator::Context::n)
+        .def_property_readonly("num_rns_bases", &Cinnamon::Emulator::Context::num_rns_bases)
+        .def_property_readonly("rns_moduli", [](const Cinnamon::Emulator::Context &context) {
+            std::vector<std::uint64_t> moduli;
+            moduli.reserve(context.num_rns_bases());
+            for (const auto &modulus : context.rns_bases()) {
+                moduli.push_back(static_cast<std::uint64_t>(modulus.value()));
+            }
+            return moduli;
+        });
 
     py::class_<Cinnamon::Emulator::CKKSEncoder>(m, "CKKSEncoder", "Cinnamon Emulator CKKS Encoder")
         .def(py::init([](const Cinnamon::Emulator::Context &context) {
@@ -91,8 +107,41 @@ PYBIND11_MODULE(_cinnamon_emulator, m) {
         .def(py::init([](const Cinnamon::Emulator::Context &context) {
             return std::unique_ptr<Cinnamon::Emulator::Emulator>(new Cinnamon::Emulator::Emulator(context));
         }))
-        .def("set_program_memory", &Cinnamon::Emulator::Emulator::set_program_memory)
-        .def("get_program_memory", &Cinnamon::Emulator::Emulator::get_program_memory)
+        .def("set_program_memory", [](Cinnamon::Emulator::Emulator &emulator,
+                                      const std::unordered_map<std::string, SerializedLimb> &memory) {
+            std::unordered_map<std::string, std::shared_ptr<Cinnamon::Emulator::Limb>> native_memory;
+            native_memory.reserve(memory.size());
+            for (const auto &entry : memory) {
+                const auto &term = entry.first;
+                const auto &serialized = entry.second;
+                const auto &rns_base_id = std::get<0>(serialized);
+                const auto &is_ntt_form = std::get<1>(serialized);
+                const auto &coeffs = std::get<2>(serialized);
+                native_memory[term] = std::make_shared<Cinnamon::Emulator::Limb>(
+                    coeffs, rns_base_id, is_ntt_form);
+            }
+            emulator.set_program_memory(native_memory);
+        })
+        .def("get_program_memory", [](Cinnamon::Emulator::Emulator &emulator) {
+            std::unordered_map<std::string, SerializedLimb> serialized_memory;
+            const auto native_memory = emulator.get_program_memory();
+            serialized_memory.reserve(native_memory.size());
+            for (const auto &entry : native_memory) {
+                const auto &term = entry.first;
+                const auto &limb = entry.second;
+                std::vector<std::uint32_t> coeffs;
+                coeffs.reserve(limb->size());
+                const auto *data = limb->data();
+                for (std::size_t i = 0; i < limb->size(); ++i) {
+                    coeffs.push_back(data[i]);
+                }
+                serialized_memory[term] = std::make_tuple(
+                    limb->rns_base_id(),
+                    limb->is_ntt_form(),
+                    std::move(coeffs));
+            }
+            return serialized_memory;
+        })
         .def("generate_inputs", &Cinnamon::Emulator::Emulator::generate_inputs)
         .def("generate_and_serialize_evalkeys", &Cinnamon::Emulator::Emulator::generate_and_serialize_evalkeys)
         .def("run_program", &Cinnamon::Emulator::Emulator::run_program_multithread)

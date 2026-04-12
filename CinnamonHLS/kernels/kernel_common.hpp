@@ -529,8 +529,8 @@ inline void cyclic_ntt_four_step(std::uint64_t *values,
                                  std::uint64_t omega,
                                  std::uint64_t mod,
                                  bool inverse_cyclic) {
-  constexpr std::uint32_t kMaxSpan = 64U;
-  constexpr std::uint32_t kMaxFourStepSide = 8U;
+  constexpr std::uint32_t kMaxSpan = 128U;
+  constexpr std::uint32_t kMaxFourStepSide = 16U;
   if (span < 2U || span > kMaxSpan || mod == 0U) {
     return;
   }
@@ -611,6 +611,37 @@ inline void cyclic_ntt_four_step(std::uint64_t *values,
   }
 }
 
+inline void bit_reverse_permute(std::uint64_t *values, std::uint32_t span) {
+  constexpr std::uint32_t kMaxSpan = 128U;
+  if (span < 2U || span > kMaxSpan || !is_power_of_two(span)) {
+    return;
+  }
+
+  std::uint64_t scratch[kMaxSpan];
+#pragma HLS ARRAY_PARTITION variable = scratch cyclic factor = 8
+
+  std::uint32_t bit_count = 0U;
+  while ((1U << bit_count) < span) {
+    ++bit_count;
+  }
+
+  for (std::uint32_t i = 0U; i < span; ++i) {
+#pragma HLS PIPELINE II = 1
+    std::uint32_t x = i;
+    std::uint32_t reversed = 0U;
+    for (std::uint32_t b = 0U; b < bit_count; ++b) {
+      reversed = (reversed << 1U) | (x & 0x1U);
+      x >>= 1U;
+    }
+    scratch[reversed] = values[i];
+  }
+
+  for (std::uint32_t i = 0U; i < span; ++i) {
+#pragma HLS PIPELINE II = 1
+    values[i] = scratch[i];
+  }
+}
+
 inline void ntt_apply_negacyclic_four_step(std::uint64_t *values,
                                            std::uint32_t span,
                                            std::uint64_t mod,
@@ -630,10 +661,12 @@ inline void ntt_apply_negacyclic_four_step(std::uint64_t *values,
       twist = mod_mul(twist, roots.psi, mod);
     }
     cyclic_ntt_four_step(values, span, roots.omega, mod, false);
+    bit_reverse_permute(values, span);
     return;
   }
 
   // Inverse cyclic NTT first, then post-twist by psi^-i.
+  bit_reverse_permute(values, span);
   cyclic_ntt_four_step(values, span, roots.omega_inv, mod, true);
   std::uint64_t twist = 1U;
   for (std::uint32_t i = 0U; i < span; ++i) {
@@ -678,6 +711,81 @@ inline std::uint32_t ilog2_pow2(std::uint32_t value) {
     ++log;
   }
   return log;
+}
+
+inline std::uint32_t reverse_bits_u32(std::uint32_t value,
+                                      std::uint32_t bit_count) {
+  std::uint32_t reversed = 0U;
+  for (std::uint32_t i = 0U; i < bit_count; ++i) {
+#pragma HLS PIPELINE II = 1
+    reversed = (reversed << 1U) | ((value >> i) & 0x1U);
+  }
+  return reversed;
+}
+
+inline std::uint32_t galois_elt_from_step(std::uint32_t coeff_count,
+                                          std::int32_t step) {
+  if (!is_power_of_two(coeff_count) || coeff_count < 2U) {
+    return 0U;
+  }
+
+  const std::uint32_t n = coeff_count;
+  const std::uint32_t m32 = n << 1U;
+  const std::uint64_t m = static_cast<std::uint64_t>(m32);
+  if (step == 0) {
+    return static_cast<std::uint32_t>(m - 1U);
+  }
+
+  const bool sign = step < 0;
+  std::uint32_t pos_step =
+      static_cast<std::uint32_t>(sign ? -step : step);
+  if (pos_step >= (n >> 1U)) {
+    pos_step &= (m32 - 1U);
+  }
+
+  std::int32_t adjusted_step = 0;
+  if (sign) {
+    adjusted_step =
+        static_cast<std::int32_t>(n >> 1U) - static_cast<std::int32_t>(pos_step);
+  } else {
+    adjusted_step = static_cast<std::int32_t>(pos_step);
+  }
+
+  constexpr std::uint64_t kGenerator = 5ULL;
+  std::uint64_t galois_elt = 1ULL;
+  while (adjusted_step-- > 0) {
+#pragma HLS PIPELINE II = 1
+    galois_elt *= kGenerator;
+    galois_elt &= (m - 1ULL);
+  }
+  return static_cast<std::uint32_t>(galois_elt);
+}
+
+inline void apply_galois_ntt_permutation(const std::uint64_t *operand,
+                                         std::uint64_t *result,
+                                         std::uint32_t coeff_count,
+                                         std::uint32_t galois_elt) {
+  if (operand == nullptr || result == nullptr || coeff_count == 0U ||
+      !is_power_of_two(coeff_count) || (galois_elt & 1U) == 0U) {
+    return;
+  }
+
+  const std::uint32_t coeff_count_power = ilog2_pow2(coeff_count);
+  const std::uint32_t coeff_count_minus_one = coeff_count - 1U;
+  for (std::uint32_t k = 0U; k < coeff_count; ++k) {
+#pragma HLS PIPELINE II = 1
+    const std::uint32_t i = coeff_count + k;
+    const std::uint32_t reversed =
+        reverse_bits_u32(i, coeff_count_power + 1U);
+    std::uint64_t index_raw =
+        (static_cast<std::uint64_t>(galois_elt) *
+         static_cast<std::uint64_t>(reversed)) >>
+        1U;
+    index_raw &= static_cast<std::uint64_t>(coeff_count_minus_one);
+    const std::uint32_t source_index =
+        reverse_bits_u32(static_cast<std::uint32_t>(index_raw), coeff_count_power);
+    result[k] = operand[source_index];
+  }
 }
 
 inline std::uint32_t automorphism_perm_info_width(std::uint32_t size) {

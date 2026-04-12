@@ -1,129 +1,127 @@
 #pragma once
 
-#include "kernel_common.hpp"
+#include "kernel_payload_common.hpp"
 
 namespace cinnamon_hls_kernel {
 
+inline std::uint32_t resolve_automorphism_operand_handle(
+    const std::uint64_t *control, const PayloadLayout &layout,
+    const std::uint32_t *register_handles, const DecodedInstruction &inst,
+    std::uint32_t &status) {
+  const bool src0_is_imm =
+      ((inst.flags & 0x1U) != 0U) || (inst.src0 == kImmOperandId);
+  if (src0_is_imm) {
+    status = kPayloadStatusUnsupportedImmediate;
+    return kPayloadInvalidHandle;
+  }
+  if (inst.src0 == kTokenOperandId) {
+    const std::uint32_t handle_id = payload_pair_lookup(
+        control, layout.token_directory_offset, layout.token_count, inst.aux);
+    if (handle_id == kPayloadInvalidHandle) {
+      status = kPayloadStatusMissingToken;
+    }
+    return handle_id;
+  }
+  if (layout.register_count == 0U) {
+    status = kPayloadStatusInvalidHandle;
+    return kPayloadInvalidHandle;
+  }
+  const std::uint32_t handle_id = register_handles[inst.src0 % layout.register_count];
+  if (handle_id == kPayloadInvalidHandle) {
+    status = kPayloadStatusInvalidHandle;
+  }
+  return handle_id;
+}
+
 inline void execute_automorphism_module(const std::uint64_t *instructions,
-                                        const std::uint64_t *inputs,
+                                        std::uint64_t *control,
+                                        std::uint64_t *payload,
                                         std::uint64_t *outputs,
                                         std::uint32_t instruction_word_count,
-                                        std::uint32_t input_count,
+                                        std::uint32_t control_count,
+                                        std::uint32_t payload_count,
                                         std::uint32_t output_count,
                                         std::uint32_t partition_id) {
+  (void)payload_count;
   if (output_count == 0U) {
     return;
   }
 
-  std::uint32_t register_count = 0U;
-  std::uint64_t mod = 0U;
-  std::uint32_t state_base = 0U;
-  init_kernel_layout(inputs, input_count, register_count, mod, state_base);
+  PayloadLayout layout;
+  std::uint32_t status = kPayloadStatusOk;
+  if (!parse_payload_layout(control, control_count, layout, status)) {
+    constexpr std::uint32_t kEmptyRegisters = 0U;
+    std::uint32_t empty_state[1] = {0U};
+    write_payload_module_outputs(outputs, output_count, status, empty_state,
+                                 kEmptyRegisters, kModuleAutomorphism,
+                                 partition_id, 0U);
+    return;
+  }
 
   constexpr std::uint32_t kMaxRegisters = 2048U;
-  constexpr std::uint32_t kMaxPermSpan = 16U;
-  constexpr std::uint32_t kMaxMatrixWords = 16U * 16U;
-  std::uint64_t state[kMaxRegisters];
-#pragma HLS BIND_STORAGE variable = state type = ram_2p impl = bram
-
   const std::uint32_t bounded_register_count =
-      (register_count > kMaxRegisters) ? kMaxRegisters : register_count;
-  init_state_from_input(inputs, input_count, state, bounded_register_count, mod,
-                        state_base);
+      (layout.register_count > kMaxRegisters) ? kMaxRegisters : layout.register_count;
+  std::uint32_t register_handles[kMaxRegisters];
+#pragma HLS BIND_STORAGE variable = register_handles type = ram_2p impl = bram
+  for (std::uint32_t i = 0; i < bounded_register_count; ++i) {
+#pragma HLS PIPELINE II = 1
+    register_handles[i] = static_cast<std::uint32_t>(
+        control[layout.register_handles_offset + i]);
+  }
 
   const std::uint32_t instruction_count =
       instruction_word_count / kInstructionWordStride;
   std::uint32_t executed = 0U;
-
   for (std::uint32_t i = 0; i < instruction_count; ++i) {
     const DecodedInstruction inst = decode_instruction(instructions, i);
     if (inst.opcode != kOpRot) {
       continue;
     }
-    if (bounded_register_count == 0U) {
-      ++executed;
-      continue;
+
+    const std::uint32_t src_handle = resolve_automorphism_operand_handle(
+        control, layout, register_handles, inst, status);
+    if (status != kPayloadStatusOk) {
+      break;
     }
 
-    if (inst.aux != 0U) {
-      const std::uint32_t span = select_perm_span(bounded_register_count, inst.rns);
-      const std::uint32_t src_base = inst.src0 % bounded_register_count;
-      const std::uint32_t dst_base = inst.dst % bounded_register_count;
-
-      std::uint64_t block[kMaxPermSpan];
-#pragma HLS ARRAY_PARTITION variable = block cyclic factor = 8
-      // RTL testbench arrays are declared as [size-1:0] and initialized with
-      // assignment patterns in descending textual order. Mirror this ordering
-      // so C/HLS vectors align bit-exactly with golden SV expectations.
-      for (std::uint32_t j = 0U; j < span; ++j) {
-#pragma HLS PIPELINE II = 1
-        const std::uint32_t src_offset = span - 1U - j;
-        block[j] = state[(src_base + src_offset) % bounded_register_count] % mod;
-      }
-
-      if (span >= 2U && is_power_of_two(span)) {
-        // AutomorphismPermutation RTL: Benes permutation over one row vector.
-        apply_benes_network(block, span, sanitize_perm_info(inst.aux, span));
-      } else {
-        // Fallback only when span is invalid for Benes.
-        for (std::uint32_t j = 0U; j < span; ++j) {
-#pragma HLS PIPELINE II = 1
-          block[j] = block[(j + 1U) % span];
-        }
-      }
-
-      for (std::uint32_t j = 0U; j < span; ++j) {
-#pragma HLS PIPELINE II = 1
-        const std::uint32_t dst_offset = span - 1U - j;
-        state[(dst_base + dst_offset) % bounded_register_count] = block[j] % mod;
-      }
-
-      // Optional matrix-path: overall Automorphism RTL
-      // (permute -> transpose -> permute -> transpose). Enabled when
-      // instruction provides a power-of-two side in rns and enough state words.
-      const bool matrix_hint_valid =
-          inst.rns >= 2U && is_power_of_two(inst.rns) && inst.rns <= 16U;
-      const std::uint32_t side = matrix_hint_valid ? inst.rns : 0U;
-      const std::uint32_t matrix_words = side * side;
-      if (matrix_hint_valid && matrix_words <= kMaxMatrixWords &&
-          matrix_words <= bounded_register_count) {
-        const std::uint32_t mat_src = src_base;
-        const std::uint32_t mat_dst = dst_base;
-        std::uint64_t matrix[kMaxMatrixWords];
-        for (std::uint32_t j = 0U; j < matrix_words; ++j) {
-#pragma HLS PIPELINE II = 1
-          matrix[j] = state[(mat_src + j) % bounded_register_count] % mod;
-        }
-        std::uint64_t row_perm =
-            static_cast<std::uint64_t>(static_cast<std::uint32_t>(inst.imm0));
-        row_perm |=
-            (static_cast<std::uint64_t>(static_cast<std::uint32_t>(inst.imm1))
-             << 32U);
-        if (row_perm == 0U) {
-          row_perm = inst.aux;
-        }
-        apply_automorphism_matrix(matrix, side, inst.aux, row_perm);
-        for (std::uint32_t j = 0U; j < matrix_words; ++j) {
-#pragma HLS PIPELINE II = 1
-          state[(mat_dst + j) % bounded_register_count] = matrix[j] % mod;
-        }
-      }
-    } else {
-      std::uint32_t rot = abs_mod_u32(inst.imm0, bounded_register_count);
-      if (rot == 0U) {
-        rot = inst.rns % bounded_register_count;
-      }
-      const std::uint32_t src_idx = inst.src0 % bounded_register_count;
-      const std::uint32_t mapped_idx = (src_idx + rot) % bounded_register_count;
-      store_register(state, bounded_register_count, inst.dst, state[mapped_idx],
-                     mod);
+    const std::uint32_t rns_base_id = inst.rns;
+    const std::uint32_t out_handle = payload_allocate_handle(
+        control, layout, rns_base_id,
+        (payload_handle_flags(control, layout, src_handle) & kPayloadFlagIsNtt) != 0U,
+        status);
+    if (status != kPayloadStatusOk) {
+      break;
     }
 
+    const std::uint32_t src_offset =
+        payload_handle_coeff_offset(layout, src_handle);
+    const std::uint32_t out_offset =
+        payload_handle_coeff_offset(layout, out_handle);
+    const std::int32_t rotation_amount =
+        (inst.imm0 == 0) ? static_cast<std::int32_t>(inst.rns) : static_cast<std::int32_t>(inst.imm0);
+    const std::uint32_t galois_elt =
+        galois_elt_from_step(layout.coeff_count, rotation_amount);
+    if (galois_elt == 0U) {
+      status = kPayloadStatusUnsupportedOpcode;
+      break;
+    }
+    apply_galois_ntt_permutation(&payload[src_offset], &payload[out_offset],
+                                 layout.coeff_count, galois_elt);
+
+    if (bounded_register_count != 0U) {
+      register_handles[inst.dst % bounded_register_count] = out_handle;
+    }
     ++executed;
   }
 
-  write_module_outputs(outputs, output_count, state, bounded_register_count,
-                       kModuleAutomorphism, partition_id, executed);
+  for (std::uint32_t i = 0; i < bounded_register_count; ++i) {
+#pragma HLS PIPELINE II = 1
+    control[layout.register_handles_offset + i] = register_handles[i];
+  }
+
+  write_payload_module_outputs(outputs, output_count, status, register_handles,
+                               bounded_register_count, kModuleAutomorphism,
+                               partition_id, executed);
 }
 
 }  // namespace cinnamon_hls_kernel

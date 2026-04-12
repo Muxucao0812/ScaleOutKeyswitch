@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import pathlib
+from typing import Any, Dict
 
 import cinnamon_emulator
 import cinnamon_fpga
@@ -26,7 +28,6 @@ PRIMES = [
 
 
 def build_program(num_chips: int = 1) -> CinnamonProgram:
-    """Build a minimal ciphertext addition program: z = x + y."""
     program = CinnamonProgram("Add", rns_bit_size=28, num_chips=num_chips)
     with program:
         x = CiphertextInput("x", 28, 51)
@@ -36,36 +37,29 @@ def build_program(num_chips: int = 1) -> CinnamonProgram:
     return program
 
 
-def to_real(value) -> float:
-    """CKKS decrypted outputs may be complex; compare using the real part."""
+def to_real(value: Any) -> float:
     if isinstance(value, complex):
         return float(value.real)
     return float(value)
 
 
-def to_imag(value) -> float:
+def to_imag(value: Any) -> float:
     if isinstance(value, complex):
         return float(value.imag)
     return 0.0
 
 
-def compare_vectors(actual, expected, tolerance: float = 1e-3):
-    """
-    Compare decrypted vector against expected real values.
-    Returns:
-      max_error: maximum absolute error
-      bad: list of mismatches (idx, actual_real, expected, error)
-    """
+def compare_vectors(actual: Any, expected: Any, tolerance: float = 1e-3) -> tuple[float, list[tuple[int, float, float, float]]]:
     max_error = 0.0
-    bad = []
-
-    for i, (a, e) in enumerate(zip(actual, expected)):
+    bad: list[tuple[int, float, float, float]] = []
+    for idx, (a, e) in enumerate(zip(actual, expected)):
         a_real = to_real(a)
-        error = abs(a_real - e)
+        error = abs(a_real - e) if math.isfinite(a_real) else float("inf")
+        if not math.isfinite(error):
+            error = float("inf")
         max_error = max(max_error, error)
         if error > tolerance:
-            bad.append((i, a_real, e, error))
-
+            bad.append((idx, a_real, float(e), error))
     return max_error, bad
 
 
@@ -78,17 +72,10 @@ def main() -> None:
     slots = 64
     scale = 1 << 28
 
-    # -------------------------------------------------
-    # Build and compile a pure addition program
-    # -------------------------------------------------
     program = build_program(num_chips)
     cinnamon_compile(program, 51, num_chips, register_file_size, str(out_dir) + "/")
 
-    # -------------------------------------------------
-    # Build CKKS context / key
-    # -------------------------------------------------
     context = cinnamon_emulator.Context(slots, PRIMES)
-
     secret_key = [0] * (2 * slots)
     for i in range(0, 2 * slots, 4):
         secret_key[i + 2] = 1
@@ -100,22 +87,13 @@ def main() -> None:
         [0, 1, 2, 3, 4, 5, 6, 7],
     )
 
-    # -------------------------------------------------
-    # Prepare raw inputs for addition only
-    # x[i] = i
-    # y[i] = 2*i
-    # expected z[i] = 3*i
-    # -------------------------------------------------
-    raw_inputs = {
+    raw_inputs: Dict[str, Any] = {
         "x": ([float(i) for i in range(slots)], scale),
         "y": ([float(2 * i) for i in range(slots)], scale),
     }
     expected = [float(3 * i) for i in range(slots)]
     output_scales = {"z": float(scale)}
 
-    # -------------------------------------------------
-    # Run FPGA emulator (sw_emu)
-    # -------------------------------------------------
     runtime = cinnamon_fpga.Emulator(
         context,
         target="sw_emu",
@@ -142,58 +120,35 @@ def main() -> None:
         register_file_size,
     )
 
-    print("dispatch:", cinnamon_fpga.describe_last_dispatch(runtime))
-    print("kernel outputs:", runtime.get_kernel_outputs())
+    dispatch = cinnamon_fpga.describe_last_dispatch(runtime)
+    print("dispatch_count:", len(dispatch))
+    print("dispatch_preview:", dispatch[:6])
+    print("timing_summary:", runtime.last_timing_summary.get("global", {}))
+    print("output ciphertexts:", runtime.get_output_ciphertexts())
 
-    # -------------------------------------------------
-    # Use CPU emulator to decrypt program outputs
-    # This follows the tutorial3 pattern
-    # -------------------------------------------------
-    cpu = cinnamon_emulator.Emulator(context)
-    cpu.generate_and_serialize_evalkeys(
-        str(out_dir / "evalkeys"),
-        str(out_dir / "program_inputs"),
-        encryptor,
-    )
-    cpu.generate_inputs(
-        str(out_dir / "program_inputs"),
-        str(out_dir / "evalkeys"),
-        raw_inputs,
-        encryptor,
-    )
-    cpu.run_program(
-        str(out_dir / "instructions"),
-        num_chips,
-        register_file_size,
-    )
-
-    decrypted = cpu.get_decrypted_outputs(encryptor, output_scales)
+    decrypted = runtime.get_decrypted_outputs(encryptor, output_scales)
     z_values = list(decrypted.get("z", []))
 
     print("\ndecrypted z first 16:")
     print(z_values[:16])
-
     print("\nexpected first 16:")
     print(expected[:16])
 
-    # -------------------------------------------------
-    # Compare only the addition result
-    # -------------------------------------------------
     print("\nDetailed comparison for first 16 slots:")
     for i, (a, e) in enumerate(zip(z_values[:16], expected[:16])):
         a_real = to_real(a)
         a_imag = to_imag(a)
-        err = abs(a_real - e)
+        err = abs(a_real - e) if math.isfinite(a_real) else float("inf")
+        if not math.isfinite(err):
+            err = float("inf")
         print(
             f"idx={i:2d}  actual={a_real:.9f}  imag={a_imag:.3e}  "
             f"expected={e:.1f}  err={err:.3e}"
         )
 
     max_error, bad = compare_vectors(z_values[:slots], expected[:slots], tolerance=1e-3)
-
     print(f"\nmax_error = {max_error:.6e}")
     print(f"mismatch_count = {len(bad)}")
-
     if bad:
         print("\nFirst 10 mismatches:")
         for idx, actual, exp, err in bad[:10]:

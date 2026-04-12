@@ -37,6 +37,31 @@ delete_find_matches() {
   done < <(find "$base" -maxdepth "$maxdepth" -mindepth 1 -name "$pattern" -print0)
 }
 
+delete_build_subdirs_except() {
+  local base="$1"
+  shift
+  if [[ ! -d "$base" ]]; then
+    return 0
+  fi
+
+  local -a keep_names=("$@")
+  while IFS= read -r -d '' path; do
+    local name
+    name="$(basename "$path")"
+    local keep=0
+    local entry
+    for entry in "${keep_names[@]}"; do
+      if [[ "$name" == "$entry" ]]; then
+        keep=1
+        break
+      fi
+    done
+    if [[ "$keep" -eq 0 ]]; then
+      delete_path "$path"
+    fi
+  done < <(find "$base" -maxdepth 1 -mindepth 1 -type d -print0)
+}
+
 echo "[INFO] Cleaning generated logs and temporary artifacts..."
 echo "[INFO] ROOT_DIR=$ROOT_DIR"
 echo "[INFO] REPO_DIR=$REPO_DIR"
@@ -73,5 +98,14 @@ if [[ -d "$ROOT_DIR/build" ]]; then
     delete_path "$path"
   done < <(find "$ROOT_DIR/build" -type d \( -name "_tmp_compile_*" -o -name "_tmp_link" -o -name "hls_tmp" \) -print0)
 fi
+
+# Generated validation/example outputs under CinnamonHLS/build; keep reusable tool builds.
+delete_path "$ROOT_DIR/build/logs"
+delete_path "$ROOT_DIR/build/detached"
+delete_path "$ROOT_DIR/build/reports"
+delete_find_matches "$ROOT_DIR/build" 1 "tmp_*"
+delete_find_matches "$ROOT_DIR/build" 1 "cinnamon_*"
+delete_find_matches "$ROOT_DIR/build" 1 "bsgs_matmul_benchmark"
+delete_build_subdirs_except "$ROOT_DIR/build" "cpu" "hw" "sw_emu" "CMakeFiles"
 
 echo "[INFO] Cleanup complete."

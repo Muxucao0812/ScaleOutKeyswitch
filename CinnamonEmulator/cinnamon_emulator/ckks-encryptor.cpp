@@ -548,7 +548,7 @@ CKKSEncryptor::generate_relin_evalkey(
 
 std::pair<RnsPolynomialPtr, RnsPolynomialPtr>
 CKKSEncryptor::generate_rotation_evalkey(
-    const std::uint32_t rotation_amount, const std::uint64_t level,
+    const std::int32_t rotation_amount, const std::uint64_t level,
     const std::uint64_t extension_size,
     const std::vector<std::uint64_t> &digit_partition,
     seal::MemoryPoolHandle pool) {
@@ -575,7 +575,7 @@ CKKSEncryptor::generate_rotation_evalkey(
 
 std::pair<RnsPolynomialPtr, RnsPolynomialPtr>
 CKKSEncryptor::generate_rotation_inv_evalkey(
-    const std::uint32_t rotation_amount, const std::uint64_t level,
+    const std::int32_t rotation_amount, const std::uint64_t level,
     const std::uint64_t extension_size,
     const std::vector<std::uint64_t> &digit_partition,
     seal::MemoryPoolHandle pool) {
