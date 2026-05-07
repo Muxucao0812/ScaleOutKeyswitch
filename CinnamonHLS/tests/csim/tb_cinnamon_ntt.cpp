@@ -1,5 +1,8 @@
 #include <cstdint>
 #include <iostream>
+#include <vector>
+
+#include "cinnamon_hls/csim_test_api.hpp"
 
 extern "C" void cinnamon_ntt(const std::uint64_t *instructions,
                              std::uint64_t *control_words,
@@ -11,165 +14,140 @@ extern "C" void cinnamon_ntt(const std::uint64_t *instructions,
                              std::uint32_t output_count,
                              std::uint32_t partition_id);
 
-namespace {
-constexpr std::uint64_t kPayloadMagic = 0x43494E4E5041594CULL;
-constexpr std::uint64_t kPayloadVersion = 1ULL;
-constexpr std::uint32_t kPayloadFlagIsNtt = 1U;
-constexpr std::uint32_t kOutputHeaderWords = 6U;
-constexpr std::uint32_t kAxiDepth = 4096U;
-
-std::uint64_t encode_word0(std::uint32_t opcode, std::uint32_t dst,
-                           std::uint32_t src0, std::uint32_t src1,
-                           std::uint32_t rns, std::uint32_t flags) {
-  return (static_cast<std::uint64_t>(opcode) & 0xFFULL) |
-         ((static_cast<std::uint64_t>(dst) & 0xFFFULL) << 8U) |
-         ((static_cast<std::uint64_t>(src0) & 0xFFFULL) << 20U) |
-         ((static_cast<std::uint64_t>(src1) & 0xFFFULL) << 32U) |
-         ((static_cast<std::uint64_t>(rns) & 0xFFFULL) << 44U) |
-         ((static_cast<std::uint64_t>(flags) & 0xFFULL) << 56U);
-}
-
-std::uint64_t encode_word1(std::int32_t imm0, std::int32_t imm1) {
-  return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(imm0)) &
-          0xFFFFFFFFULL) |
-         ((static_cast<std::uint64_t>(static_cast<std::uint32_t>(imm1)) &
-           0xFFFFFFFFULL)
-          << 32U);
-}
-}  // namespace
-
 int main() {
+  using namespace cinnamon_hls_kernel;
+  using namespace cinnamon_hls_test;
+
   {
     constexpr std::uint64_t mod = 1179649ULL;
-    constexpr std::uint32_t register_count = 1U;
-    constexpr std::uint32_t coeff_count = 4U;
-    constexpr std::uint32_t rns_count = 1U;
-    constexpr std::uint32_t handle_count = 1U;
-    constexpr std::uint32_t handle_capacity = 4U;
-    constexpr std::uint32_t control_count =
-        9U + (rns_count * 2U) + register_count + (handle_capacity * 2U);
-    constexpr std::uint32_t payload_count = handle_capacity * coeff_count;
-    constexpr std::uint32_t output_count = kOutputHeaderWords + register_count;
 
-    std::uint64_t control_words[kAxiDepth] = {};
-    control_words[0] = kPayloadMagic;
-    control_words[1] = kPayloadVersion;
-    control_words[2] = register_count;
-    control_words[3] = coeff_count;
-    control_words[4] = rns_count;
-    control_words[5] = handle_count;
-    control_words[6] = handle_capacity;
-    control_words[7] = 0U;
-    control_words[8] = 0U;
-    control_words[9] = 1U;
-    control_words[10] = mod;
-    control_words[11] = 1U;
-    control_words[12] = 1U;
-    control_words[13] = 0U;
+    PayloadCaseSpec spec;
+    spec.register_count = 1U;
+    spec.coeff_count = 4U;
+    spec.handle_count = 1U;
+    spec.handle_capacity = 4U;
+    spec.rns_moduli = {{1U, mod}};
+    spec.register_handles = {1U};
+    spec.handle_metadata = {{1U, kPayloadFlagIsNtt}};
+    write_handle_payload(spec.payload_words, spec.coeff_count, 1U,
+                         {0ULL, 8ULL, 4ULL, 12ULL});
 
-    std::uint64_t payload_words[kAxiDepth] = {};
-    payload_words[0] = 0ULL;
-    payload_words[1] = 8ULL;
-    payload_words[2] = 4ULL;
-    payload_words[3] = 12ULL;
+    const std::vector<std::uint64_t> instructions = encode_instructions({
+        {kOpNtt, 0U, 0U, 0U, 1U, 0U, 4, 0, 0ULL, 0ULL},
+    });
 
-    std::uint64_t instructions[kAxiDepth] = {
-        encode_word0(12U, 0U, 0U, 0U, 1U, 0U), encode_word1(4, 0), 0ULL, 0ULL};
-    std::uint64_t outputs[kAxiDepth] = {};
+    std::cout << "[TB][ntt] span4 start: mod=" << mod
+              << ", inst=" << (instructions.size() / kInstructionWordStride) << '\n';
 
-    cinnamon_ntt(instructions, control_words, payload_words, outputs, 4U,
-                 control_count, payload_count, output_count, 0U);
+    PayloadBuffers buffers = build_payload_buffers(spec);
+    run_payload_kernel(cinnamon_ntt, instructions, buffers, 0U);
 
-    if (outputs[0] != 0ULL) {
-      std::cerr << "ntt span4 status mismatch: outputs[0]=" << outputs[0] << '\n';
+    if (buffers.outputs[0] != 0ULL) {
+      std::cerr << "[TB][ntt][FAIL] span4 status mismatch: outputs[0]="
+                << buffers.outputs[0] << '\n';
       return 1;
     }
-    if (outputs[1] != 1ULL || outputs[kOutputHeaderWords] != 2ULL) {
-      std::cerr << "ntt span4 handle mismatch: executed=" << outputs[1]
-                << " reg0=" << outputs[kOutputHeaderWords] << '\n';
+    if (buffers.outputs[1] != 1ULL ||
+        buffers.outputs[cinnamon_hls_test::kOutputHeaderWords] != 2ULL) {
+      std::cerr << "[TB][ntt][FAIL] span4 handle mismatch: executed="
+                << buffers.outputs[1]
+                << " reg0="
+                << buffers.outputs[cinnamon_hls_test::kOutputHeaderWords] << '\n';
       return 2;
     }
-    if (control_words[5] != 2ULL || control_words[14] != kPayloadFlagIsNtt) {
-      std::cerr << "ntt span4 metadata mismatch: handle_count=" << control_words[5]
-                << " flags(handle2)=" << control_words[14] << '\n';
+
+    const std::uint32_t handle_meta_offset =
+        kPayloadHeaderWords + static_cast<std::uint32_t>(spec.rns_moduli.size()) * 2U +
+        spec.register_count;
+    if (buffers.control_words[5] != 2ULL ||
+        buffers.control_words[handle_meta_offset + 2U] != 1ULL ||
+        buffers.control_words[handle_meta_offset + 3U] != kPayloadFlagIsNtt) {
+      std::cerr << "[TB][ntt][FAIL] span4 metadata mismatch: handle_count="
+                << buffers.control_words[5] << " handle2_meta={"
+                << buffers.control_words[handle_meta_offset + 2U] << ", "
+                << buffers.control_words[handle_meta_offset + 3U] << "}\n";
       return 3;
     }
-    if (payload_words[4] != 1146641ULL || payload_words[5] != 419093ULL ||
-        payload_words[6] != 2288ULL || payload_words[7] != 791276ULL) {
-      std::cerr << "ntt span4 mismatch: got={" << payload_words[4] << ", "
-                << payload_words[5] << ", " << payload_words[6] << ", "
-                << payload_words[7]
+
+    const std::uint32_t handle2_base = payload_coeff_offset(spec.coeff_count, 2U);
+    if (buffers.payload_words[handle2_base + 0U] != 1146641ULL ||
+        buffers.payload_words[handle2_base + 1U] != 419093ULL ||
+        buffers.payload_words[handle2_base + 2U] != 2288ULL ||
+        buffers.payload_words[handle2_base + 3U] != 791276ULL) {
+      std::cerr << "[TB][ntt][FAIL] span4 payload mismatch: got={"
+                << buffers.payload_words[handle2_base + 0U] << ", "
+                << buffers.payload_words[handle2_base + 1U] << ", "
+                << buffers.payload_words[handle2_base + 2U] << ", "
+                << buffers.payload_words[handle2_base + 3U]
                 << "} expected={1146641, 419093, 2288, 791276}\n";
       return 4;
     }
+    std::cout << "[TB][ntt] span4 PASS\n";
   }
 
   {
     constexpr std::uint64_t mod = 786433ULL;
-    constexpr std::uint32_t register_count = 1U;
-    constexpr std::uint32_t coeff_count = 8U;
-    constexpr std::uint32_t rns_count = 1U;
-    constexpr std::uint32_t handle_count = 1U;
-    constexpr std::uint32_t handle_capacity = 4U;
-    constexpr std::uint32_t control_count =
-        9U + (rns_count * 2U) + register_count + (handle_capacity * 2U);
-    constexpr std::uint32_t payload_count = handle_capacity * coeff_count;
-    constexpr std::uint32_t output_count = kOutputHeaderWords + register_count;
 
-    std::uint64_t control_words[kAxiDepth] = {};
-    control_words[0] = kPayloadMagic;
-    control_words[1] = kPayloadVersion;
-    control_words[2] = register_count;
-    control_words[3] = coeff_count;
-    control_words[4] = rns_count;
-    control_words[5] = handle_count;
-    control_words[6] = handle_capacity;
-    control_words[7] = 0U;
-    control_words[8] = 0U;
-    control_words[9] = 4U;
-    control_words[10] = mod;
-    control_words[11] = 1U;
-    control_words[12] = 4U;
-    control_words[13] = 0U;
+    PayloadCaseSpec spec;
+    spec.register_count = 1U;
+    spec.coeff_count = 8U;
+    spec.handle_count = 1U;
+    spec.handle_capacity = 4U;
+    spec.rns_moduli = {{4U, mod}};
+    spec.register_handles = {1U};
+    spec.handle_metadata = {{4U, 0U}};
+    write_handle_payload(spec.payload_words, spec.coeff_count, 1U,
+                         {0ULL, 1ULL, 2ULL, 3ULL, 4ULL, 5ULL, 6ULL, 7ULL});
 
-    std::uint64_t payload_words[kAxiDepth] = {};
-    for (std::uint32_t i = 0; i < coeff_count; ++i) {
-      payload_words[i] = i;
-    }
+    const std::vector<std::uint64_t> instructions = encode_instructions({
+        {kOpNtt, 0U, 0U, 0U, 4U, 0U, 8, 0, 0ULL, 0ULL},
+        {kOpInt, 0U, 0U, 0U, 4U, 0U, 8, 0, 0ULL, 0ULL},
+    });
 
-    std::uint64_t instructions[kAxiDepth] = {
-        encode_word0(12U, 0U, 0U, 0U, 4U, 0U), encode_word1(8, 0), 0ULL, 0ULL,
-        encode_word0(13U, 0U, 0U, 0U, 4U, 0U), encode_word1(8, 0), 0ULL, 0ULL};
-    std::uint64_t outputs[kAxiDepth] = {};
+    std::cout << "[TB][ntt] roundtrip start: mod=" << mod
+              << ", inst=" << (instructions.size() / kInstructionWordStride) << '\n';
 
-    cinnamon_ntt(instructions, control_words, payload_words, outputs, 8U,
-                 control_count, payload_count, output_count, 0U);
+    PayloadBuffers buffers = build_payload_buffers(spec);
+    run_payload_kernel(cinnamon_ntt, instructions, buffers, 0U);
 
-    if (outputs[0] != 0ULL) {
-      std::cerr << "ntt roundtrip status mismatch: outputs[0]=" << outputs[0] << '\n';
+    if (buffers.outputs[0] != 0ULL) {
+      std::cerr << "[TB][ntt][FAIL] roundtrip status mismatch: outputs[0]="
+                << buffers.outputs[0] << '\n';
       return 5;
     }
-    if (outputs[1] != 2ULL || outputs[kOutputHeaderWords] != 3ULL) {
-      std::cerr << "ntt roundtrip handle mismatch: executed=" << outputs[1]
-                << " reg0=" << outputs[kOutputHeaderWords] << '\n';
+    if (buffers.outputs[1] != 2ULL ||
+        buffers.outputs[cinnamon_hls_test::kOutputHeaderWords] != 3ULL) {
+      std::cerr << "[TB][ntt][FAIL] roundtrip handle mismatch: executed="
+                << buffers.outputs[1] << " reg0="
+                << buffers.outputs[cinnamon_hls_test::kOutputHeaderWords] << '\n';
       return 6;
     }
-    if (control_words[5] != 3ULL || control_words[16] != 4ULL ||
-        control_words[17] != 0ULL) {
-      std::cerr << "ntt roundtrip metadata mismatch: handle_count=" << control_words[5]
-                << " handle3_meta={" << control_words[16] << ", "
-                << control_words[17] << "}\n";
+
+    const std::uint32_t handle_meta_offset =
+        kPayloadHeaderWords + static_cast<std::uint32_t>(spec.rns_moduli.size()) * 2U +
+        spec.register_count;
+    if (buffers.control_words[5] != 3ULL ||
+        buffers.control_words[handle_meta_offset + 4U] != 4ULL ||
+        buffers.control_words[handle_meta_offset + 5U] != 0ULL) {
+      std::cerr << "[TB][ntt][FAIL] roundtrip metadata mismatch: handle_count="
+                << buffers.control_words[5] << " handle3_meta={"
+                << buffers.control_words[handle_meta_offset + 4U] << ", "
+                << buffers.control_words[handle_meta_offset + 5U] << "}\n";
       return 7;
     }
-    for (std::uint32_t i = 0; i < coeff_count; ++i) {
-      if (payload_words[16U + i] != i) {
-        std::cerr << "ntt roundtrip mismatch at index " << i
-                  << ": expected " << i << " got " << payload_words[16U + i]
-                  << '\n';
+
+    const std::uint32_t handle3_base = payload_coeff_offset(spec.coeff_count, 3U);
+    for (std::uint32_t i = 0U; i < spec.coeff_count; ++i) {
+      if (buffers.payload_words[handle3_base + i] != i) {
+        std::cerr << "[TB][ntt][FAIL] roundtrip payload mismatch at index " << i
+                  << ": expected " << i << " got "
+                  << buffers.payload_words[handle3_base + i] << '\n';
         return 8;
       }
     }
+    std::cout << "[TB][ntt] roundtrip PASS\n";
   }
 
+  std::cout << "[TB][ntt] PASS\n";
   return 0;
 }

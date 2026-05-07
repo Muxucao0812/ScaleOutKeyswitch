@@ -22,11 +22,11 @@ STACK_PARTS = [
     ("other_host_s", "Other host", "#dd8452"),
 ]
 
-MODULE_NAMES = ["memory", "arithmetic", "montgomery", "ntt", "base_conv", "automorphism"]
+MODULE_NAMES = ["memory", "arithmetic", "modmul", "ntt", "base_conv", "automorphism"]
 MODULE_COLORS = {
     "memory": "#c44e52",
     "arithmetic": "#4c72b0",
-    "montgomery": "#55a868",
+    "modmul": "#55a868",
     "ntt": "#8172b2",
     "base_conv": "#dd8452",
     "automorphism": "#64b5cd",

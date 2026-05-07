@@ -106,7 +106,7 @@ inline void execute_ntt_module(const std::uint64_t *instructions,
   std::uint32_t register_handles[kMaxRegisters];
 #pragma HLS BIND_STORAGE variable = register_handles type = ram_2p impl = bram
   for (std::uint32_t i = 0; i < bounded_register_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     register_handles[i] = static_cast<std::uint32_t>(
         control[layout.register_handles_offset + i]);
   }
@@ -133,6 +133,7 @@ inline void execute_ntt_module(const std::uint64_t *instructions,
       status = kPayloadStatusMissingModulus;
       break;
     }
+    const std::uint64_t mod_mu = lookup_barrett_mu(mod);
 
     const bool inverse = (inst.opcode == kOpInt);
     const std::uint32_t out_handle = payload_allocate_handle(
@@ -145,9 +146,11 @@ inline void execute_ntt_module(const std::uint64_t *instructions,
         payload_handle_coeff_offset(layout, src_handle);
     const std::uint32_t out_offset =
         payload_handle_coeff_offset(layout, out_handle);
+
     for (std::uint32_t coeff = 0; coeff < layout.coeff_count; ++coeff) {
-#pragma HLS PIPELINE II = 1
-      payload[out_offset + coeff] = payload[src_offset + coeff] % mod;
+#pragma HLS PIPELINE II = 4
+      payload[out_offset + coeff] =
+          mod_reduce_precomputed(payload[src_offset + coeff], mod, mod_mu);
     }
     ntt_apply_negacyclic_four_step(&payload[out_offset], layout.coeff_count, mod,
                                    target_rns_base_id, inverse);
@@ -159,7 +162,7 @@ inline void execute_ntt_module(const std::uint64_t *instructions,
   }
 
   for (std::uint32_t i = 0; i < bounded_register_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     control[layout.register_handles_offset + i] = register_handles[i];
   }
 

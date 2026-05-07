@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import gc
 import json
 import os
 import pathlib
@@ -93,6 +94,10 @@ _JSONL_ENV = "CINNAMON_FPGA_JSONL_LOG"
 _JSONL_DEBUG_ENV = "CINNAMON_FPGA_JSONL_DEBUG_LOG"
 _JSONL_DEBUG_FLAG_ENV = "CINNAMON_FPGA_JSONL_DEBUG"
 _DEBUG_PREVIEW_WORDS = 8
+_PAYLOAD_BO_MIN_BYTES_ENV = "CINNAMON_FPGA_PAYLOAD_BO_MIN_BYTES"
+_PAYLOAD_BO_MIN_BYTES_DEFAULT = 0
+_DISPATCH_WAIT_TIMEOUT_MS_ENV = "CINNAMON_FPGA_DISPATCH_WAIT_TIMEOUT_MS"
+_DISPATCH_WAIT_TIMEOUT_MS_DEFAULT = 0
 
 
 def _env_flag(name: str) -> bool:
@@ -149,6 +154,73 @@ def _load_pyxrt():
         ) from exc
 
 
+def _align_size(value: int, alignment: int = 4096) -> int:
+    size = max(int(value), 1)
+    step = max(int(alignment), 1)
+    rem = size % step
+    if rem:
+        size += step - rem
+    return size
+
+
+def _grown_size(current_size: int, required_size: int, growth_step_bytes: int = 0) -> int:
+    current = max(int(current_size), 0)
+    required = max(int(required_size), 1)
+    if current >= required:
+        return current
+    growth_step = max(int(growth_step_bytes), 0)
+    target = required if growth_step <= 0 else max(required, current + growth_step)
+    return _align_size(target)
+
+
+def _payload_bo_min_size_bytes() -> int:
+    raw = os.getenv(_PAYLOAD_BO_MIN_BYTES_ENV, "").strip()
+    if not raw:
+        return int(_PAYLOAD_BO_MIN_BYTES_DEFAULT)
+    try:
+        value = int(raw)
+        return max(value, 0)
+    except ValueError:
+        return int(_PAYLOAD_BO_MIN_BYTES_DEFAULT)
+
+
+def _dispatch_wait_timeout_ms() -> int:
+    raw = os.getenv(_DISPATCH_WAIT_TIMEOUT_MS_ENV, "").strip()
+    if not raw:
+        return int(_DISPATCH_WAIT_TIMEOUT_MS_DEFAULT)
+    try:
+        value = int(raw)
+    except ValueError:
+        return int(_DISPATCH_WAIT_TIMEOUT_MS_DEFAULT)
+    return max(int(value), 0)
+
+
+def _is_completed_wait_state(state: Any) -> bool:
+    state_text = str(state)
+    return "ERT_CMD_STATE_COMPLETED" in state_text
+
+
+def _wait_for_run_completion(
+    *,
+    run: Any,
+    timeout_ms: int,
+    kernel_name: str,
+    partition_id: int,
+    board_index: int,
+) -> None:
+    if timeout_ms > 0:
+        state = run.wait(int(timeout_ms))
+    else:
+        state = run.wait()
+    if _is_completed_wait_state(state):
+        return
+    raise TimeoutError(
+        "Kernel wait did not reach COMPLETED state: "
+        f"kernel={kernel_name} partition={partition_id} board={board_index} "
+        f"timeout_ms={timeout_ms} state={state}"
+    )
+
+
 def _pack_words(
     words: Sequence[int],
     minimum_words: int = 1,
@@ -174,18 +246,47 @@ def _unpack_words(payload: bytes) -> List[int]:
     return list(struct.unpack(f"<{len(payload) // 8}Q", payload))
 
 
+def _assert_xclbin_is_current(xclbin_path: pathlib.Path) -> None:
+    if not xclbin_path.exists():
+        raise FileNotFoundError(f"xclbin not found: {xclbin_path}")
+
+    try:
+        xclbin_mtime_ns = xclbin_path.stat().st_mtime_ns
+    except FileNotFoundError:
+        raise FileNotFoundError(f"xclbin not found: {xclbin_path}") from None
+
+    newest_xo: pathlib.Path | None = None
+    newest_xo_mtime_ns = -1
+    for xo_path in sorted(xclbin_path.parent.glob("*.xo")):
+        try:
+            xo_mtime_ns = xo_path.stat().st_mtime_ns
+        except FileNotFoundError:
+            continue
+        if xo_mtime_ns > newest_xo_mtime_ns:
+            newest_xo = xo_path
+            newest_xo_mtime_ns = xo_mtime_ns
+
+    if newest_xo is None or newest_xo_mtime_ns <= xclbin_mtime_ns:
+        return
+
+    raise RuntimeError(
+        "xclbin appears stale relative to sibling xo artifacts: "
+        f"xclbin={xclbin_path} newest_xo={newest_xo}. "
+        "Re-run the hardware link step before dispatch."
+    )
+
+
 def _resolve_device_handle(config: DispatchConfig, board_index: int) -> _DeviceHandle:
     pyxrt = _load_pyxrt()
     xclbin_path = str(config.xclbin_path.resolve())
     cache_key = (int(board_index), xclbin_path)
 
+    _assert_xclbin_is_current(config.xclbin_path)
+
     with _KERNEL_CACHE_LOCK:
         cached = _DEVICE_CACHE.get(cache_key)
     if cached is not None:
         return cached
-
-    if not config.xclbin_path.exists():
-        raise FileNotFoundError(f"xclbin not found: {config.xclbin_path}")
 
     device = pyxrt.device(board_index)
     xbin = pyxrt.xclbin(xclbin_path)
@@ -242,23 +343,30 @@ def _resolve_bo_bundle(
 
     needs_realloc = (
         bundle is None
-        or bundle.inst_size != inst_size
-        or bundle.inp_size != inp_size
-        or bundle.out_size != out_size
+        or bundle.inst_size < inst_size
+        or bundle.inp_size < inp_size
+        or bundle.out_size < out_size
     )
     if needs_realloc:
         kernel = handle.kernel
         pyxrt = handle.pyxrt
+        next_inst_size = _grown_size(bundle.inst_size if bundle is not None else 0, inst_size)
+        next_inp_size = _grown_size(bundle.inp_size if bundle is not None else 0, inp_size)
+        next_out_size = _grown_size(bundle.out_size if bundle is not None else 0, out_size)
+        old_bundle = bundle
         bundle = _BoBundle(
-            inst_bo=pyxrt.bo(handle.device, inst_size, pyxrt.bo.normal, kernel.group_id(0)),
-            inp_bo=pyxrt.bo(handle.device, inp_size, pyxrt.bo.normal, kernel.group_id(1)),
-            out_bo=pyxrt.bo(handle.device, out_size, pyxrt.bo.normal, kernel.group_id(2)),
-            inst_size=inst_size,
-            inp_size=inp_size,
-            out_size=out_size,
+            inst_bo=pyxrt.bo(handle.device, next_inst_size, pyxrt.bo.normal, kernel.group_id(0)),
+            inp_bo=pyxrt.bo(handle.device, next_inp_size, pyxrt.bo.normal, kernel.group_id(1)),
+            out_bo=pyxrt.bo(handle.device, next_out_size, pyxrt.bo.normal, kernel.group_id(2)),
+            inst_size=next_inst_size,
+            inp_size=next_inp_size,
+            out_size=next_out_size,
         )
         with _KERNEL_CACHE_LOCK:
             _BO_CACHE[cache_key] = bundle
+        if old_bundle is not None:
+            del old_bundle
+            gc.collect()
     return bundle
 
 
@@ -273,37 +381,58 @@ def _resolve_payload_bo_bundle(
     pay_size: int,
     out_size: int,
 ) -> _PayloadBoBundle:
+    kernel = handle.kernel
+    group_signature = (
+        int(kernel.group_id(0)) & 0xFFFF,
+        int(kernel.group_id(1)) & 0xFFFF,
+        int(kernel.group_id(2)) & 0xFFFF,
+        int(kernel.group_id(3)) & 0xFFFF,
+    )
     cache_key = (
         int(board_index),
         str(config.xclbin_path.resolve()),
-        str(config.kernel_name),
+        "payload_shared",
         int(partition_id),
+        *group_signature,
     )
     with _KERNEL_CACHE_LOCK:
         bundle = _PAYLOAD_BO_CACHE.get(cache_key)
 
     needs_realloc = (
         bundle is None
-        or bundle.inst_size != inst_size
-        or bundle.ctl_size != ctl_size
-        or bundle.pay_size != pay_size
-        or bundle.out_size != out_size
+        or bundle.inst_size < inst_size
+        or bundle.ctl_size < ctl_size
+        or bundle.pay_size < pay_size
+        or bundle.out_size < out_size
     )
     if needs_realloc:
-        kernel = handle.kernel
         pyxrt = handle.pyxrt
+        next_inst_size = _grown_size(bundle.inst_size if bundle is not None else 0, inst_size)
+        next_ctl_size = _grown_size(bundle.ctl_size if bundle is not None else 0, ctl_size)
+        next_pay_size = _grown_size(
+            bundle.pay_size if bundle is not None else 0,
+            pay_size,
+            growth_step_bytes=(8 << 20),
+        )
+        if bundle is None:
+            next_pay_size = max(next_pay_size, _align_size(_payload_bo_min_size_bytes()))
+        next_out_size = _grown_size(bundle.out_size if bundle is not None else 0, out_size)
+        old_bundle = bundle
         bundle = _PayloadBoBundle(
-            inst_bo=pyxrt.bo(handle.device, inst_size, pyxrt.bo.normal, kernel.group_id(0)),
-            ctl_bo=pyxrt.bo(handle.device, ctl_size, pyxrt.bo.normal, kernel.group_id(1)),
-            pay_bo=pyxrt.bo(handle.device, pay_size, pyxrt.bo.normal, kernel.group_id(2)),
-            out_bo=pyxrt.bo(handle.device, out_size, pyxrt.bo.normal, kernel.group_id(3)),
-            inst_size=inst_size,
-            ctl_size=ctl_size,
-            pay_size=pay_size,
-            out_size=out_size,
+            inst_bo=pyxrt.bo(handle.device, next_inst_size, pyxrt.bo.normal, kernel.group_id(0)),
+            ctl_bo=pyxrt.bo(handle.device, next_ctl_size, pyxrt.bo.normal, kernel.group_id(1)),
+            pay_bo=pyxrt.bo(handle.device, next_pay_size, pyxrt.bo.normal, kernel.group_id(2)),
+            out_bo=pyxrt.bo(handle.device, next_out_size, pyxrt.bo.normal, kernel.group_id(3)),
+            inst_size=next_inst_size,
+            ctl_size=next_ctl_size,
+            pay_size=next_pay_size,
+            out_size=next_out_size,
         )
         with _KERNEL_CACHE_LOCK:
             _PAYLOAD_BO_CACHE[cache_key] = bundle
+        if old_bundle is not None:
+            del old_bundle
+            gc.collect()
     return bundle
 
 
@@ -384,7 +513,29 @@ def run_partition_dispatch(
         partition_id,
     )
     t_wait_begin = time.perf_counter()
-    run.wait()
+    wait_timeout_ms = _dispatch_wait_timeout_ms()
+    try:
+        _wait_for_run_completion(
+            run=run,
+            timeout_ms=wait_timeout_ms,
+            kernel_name=str(config.kernel_name),
+            partition_id=int(partition_id),
+            board_index=int(board_index),
+        )
+    except Exception as exc:
+        t_wait_done = time.perf_counter()
+        _emit_jsonl(
+            "pyxrt.run_partition_dispatch_wait_failure",
+            payload={
+                "card_id": int(board_index),
+                "partition_id": int(partition_id),
+                "kernel_name": str(config.kernel_name),
+                "wait_timeout_ms": int(wait_timeout_ms),
+                "wait_s": float(t_wait_done - t_wait_begin),
+                "error": str(exc),
+            },
+        )
+        raise
     t_wait_done = time.perf_counter()
 
     bundle.out_bo.sync(
@@ -456,6 +607,29 @@ def run_payload_partition_dispatch(
     pyxrt = handle.pyxrt
     kernel = handle.kernel
     t_setup_done = time.perf_counter()
+    _emit_jsonl(
+        "pyxrt.run_payload_partition_dispatch_begin",
+        payload={
+            "card_id": int(board_index),
+            "partition_id": int(partition_id),
+            "kernel_name": str(config.kernel_name),
+            "instruction_count": int(len(instruction_words)),
+            "control_count": int(len(control_words)),
+            "payload_count": int(len(payload_words)),
+            "output_count": int(max(config.output_word_count, 1)),
+        },
+        debug_payload={
+            "raw_instruction_preview": [
+                int(word) for word in instruction_words[:_DEBUG_PREVIEW_WORDS]
+            ],
+            "raw_control_preview": [
+                int(word) for word in control_words[:_DEBUG_PREVIEW_WORDS]
+            ],
+            "raw_payload_preview": [
+                int(word) for word in payload_words[:_DEBUG_PREVIEW_WORDS]
+            ],
+        },
+    )
 
     word_alignment = max(int(config.word_alignment), 1)
     instructions_packed = _pack_words(instruction_words, alignment_words=word_alignment)
@@ -498,6 +672,18 @@ def run_payload_partition_dispatch(
         pyxrt=pyxrt,
     )
     t_h2d_done = time.perf_counter()
+    _emit_jsonl(
+        "pyxrt.run_payload_partition_dispatch_h2d_done",
+        payload={
+            "card_id": int(board_index),
+            "partition_id": int(partition_id),
+            "kernel_name": str(config.kernel_name),
+            "instruction_count": int(len(instruction_words)),
+            "control_count": int(len(control_words)),
+            "payload_count": int(len(payload_words)),
+            "h2d_s": float(t_h2d_done - t_setup_done),
+        },
+    )
 
     run = kernel(
         bundle.inst_bo,
@@ -510,8 +696,41 @@ def run_payload_partition_dispatch(
         output_words_count,
         partition_id,
     )
+    _emit_jsonl(
+        "pyxrt.run_payload_partition_dispatch_launch_done",
+        payload={
+            "card_id": int(board_index),
+            "partition_id": int(partition_id),
+            "kernel_name": str(config.kernel_name),
+            "instruction_count": int(len(instruction_words)),
+            "control_count": int(len(control_words)),
+            "payload_count": int(len(payload_words)),
+        },
+    )
     t_wait_begin = time.perf_counter()
-    run.wait()
+    wait_timeout_ms = _dispatch_wait_timeout_ms()
+    try:
+        _wait_for_run_completion(
+            run=run,
+            timeout_ms=wait_timeout_ms,
+            kernel_name=str(config.kernel_name),
+            partition_id=int(partition_id),
+            board_index=int(board_index),
+        )
+    except Exception as exc:
+        t_wait_done = time.perf_counter()
+        _emit_jsonl(
+            "pyxrt.run_payload_partition_dispatch_wait_failure",
+            payload={
+                "card_id": int(board_index),
+                "partition_id": int(partition_id),
+                "kernel_name": str(config.kernel_name),
+                "wait_timeout_ms": int(wait_timeout_ms),
+                "wait_s": float(t_wait_done - t_wait_begin),
+                "error": str(exc),
+            },
+        )
+        raise
     t_wait_done = time.perf_counter()
 
     bundle.ctl_bo.sync(

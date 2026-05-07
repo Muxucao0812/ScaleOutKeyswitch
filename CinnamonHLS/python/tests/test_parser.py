@@ -85,7 +85,7 @@ def test_opcode_module_mapping_covers_all_major_paths() -> None:
     assert module_for_opcode("spill") == "memory"
     assert module_for_opcode("snd") == "memory"
     assert module_for_opcode("add") == "arithmetic"
-    assert module_for_opcode("mul") == "montgomery"
+    assert module_for_opcode("mul") == "modmul"
     assert module_for_opcode("ntt") == "ntt"
     assert module_for_opcode("bci") == "base_conv"
     assert module_for_opcode("bcw") == "base_conv"
@@ -115,7 +115,7 @@ syn @ 1:1 :
     buckets = split_stream_by_module(stream)
     assert len(buckets["memory"].instruction_words) == 8
     assert len(buckets["arithmetic"].instruction_words) == 4
-    assert len(buckets["montgomery"].instruction_words) == 4
+    assert len(buckets["modmul"].instruction_words) == 4
     assert len(buckets["ntt"].instruction_words) == 4
     assert len(buckets["automorphism"].instruction_words) == 4
     assert len(buckets["base_conv"].instruction_words) == 4

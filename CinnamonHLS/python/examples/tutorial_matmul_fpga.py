@@ -325,7 +325,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--sizes",
-        default="16,32,64,128",
+        default="16",
         help="Comma-separated square sizes like 16,32,64,128",
     )
     parser.add_argument(

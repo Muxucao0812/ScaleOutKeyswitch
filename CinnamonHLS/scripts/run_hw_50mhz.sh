@@ -2,17 +2,27 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TARGET="${1:-sw_emu}"   # sw_emu | hw_emu | hw
+TARGET="hw"
 PLATFORM="${PLATFORM:-xilinx_u55c_gen3x16_xdma_3_202210_1}"
 PACKAGE_NAME="${PACKAGE_NAME:-cinnamon_fpga}"
-BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build/${TARGET}}"
-KERNEL_DIR="${ROOT_DIR}/kernels"
-KERNEL_FREQUENCY_MHZ="${KERNEL_FREQUENCY_MHZ:-200}"
-COMPILE_FREQUENCY_MHZ="${COMPILE_FREQUENCY_MHZ:-$KERNEL_FREQUENCY_MHZ}"
-LINK_FREQUENCY_MHZ="${LINK_FREQUENCY_MHZ:-$KERNEL_FREQUENCY_MHZ}"
+BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build/hw_50mhz}"
+KERNEL_DIR="$ROOT_DIR/kernels"
+COMPILE_FREQUENCY_MHZ="${COMPILE_FREQUENCY_MHZ:-50}"
+LINK_FREQUENCY_MHZ="${LINK_FREQUENCY_MHZ:-50}"
 CONNECTIVITY_CFG="${CONNECTIVITY_CFG:-$ROOT_DIR/config/hbm_memory_connectivity.cfg}"
-EXTRA_LINK_CFG="${EXTRA_LINK_CFG:-}"
-BUILD_STAGE="${BUILD_STAGE:-full}"   # full | compile | link
+EXTRA_LINK_CFG="${EXTRA_LINK_CFG:-$ROOT_DIR/config/hw_impl_high_effort.cfg}"
+BUILD_STAGE="${BUILD_STAGE:-full}" # full | compile | link
+
+KERNEL_NAMES=(
+  cinnamon_memory
+  cinnamon_arithmetic
+  cinnamon_modmul
+  cinnamon_ntt
+  cinnamon_base_conv
+  cinnamon_automorphism
+  cinnamon_transpose
+  cinnamon_dispatch
+)
 
 if ! command -v v++ >/dev/null 2>&1; then
   echo "v++ not found in PATH. Please load Vitis 2024.1 first." >&2
@@ -30,42 +40,33 @@ esac
 mkdir -p "$BUILD_DIR"
 XCLBIN_FILE="$BUILD_DIR/${PACKAGE_NAME}.${TARGET}.xclbin"
 
-KERNEL_NAMES=(
-  cinnamon_memory
-  cinnamon_arithmetic
-  cinnamon_montgomery
-  cinnamon_ntt
-  cinnamon_base_conv
-  cinnamon_automorphism
-  cinnamon_transpose
-  cinnamon_dispatch
-)
-
 XO_FILES=()
-for KERNEL_NAME in "${KERNEL_NAMES[@]}"; do
-  SRC_FILE="$KERNEL_DIR/${KERNEL_NAME}.cpp"
-  if [[ ! -f "$SRC_FILE" ]]; then
-    echo "Kernel source not found: $SRC_FILE" >&2
+for kernel_name in "${KERNEL_NAMES[@]}"; do
+  src_file="$KERNEL_DIR/${kernel_name}.cpp"
+  xo_file="$BUILD_DIR/${kernel_name}.xo"
+  XO_FILES+=("$xo_file")
+
+  if [[ ! -f "$src_file" ]]; then
+    echo "Kernel source not found: $src_file" >&2
     exit 1
   fi
-  XO_FILE="$BUILD_DIR/${KERNEL_NAME}.xo"
-  XO_FILES+=("$XO_FILE")
+
   if [[ "$BUILD_STAGE" != "link" ]]; then
     v++ -c -t "$TARGET" --platform "$PLATFORM" \
-      -k "$KERNEL_NAME" \
+      -k "$kernel_name" \
       --kernel_frequency "$COMPILE_FREQUENCY_MHZ" \
       -I"$ROOT_DIR/include" \
       -I"$KERNEL_DIR" \
-      --temp_dir "$BUILD_DIR/_tmp_compile_${KERNEL_NAME}" \
-      -o "$XO_FILE" "$SRC_FILE"
-  elif [[ ! -f "$XO_FILE" ]]; then
-    echo "Missing xo for link stage: $XO_FILE" >&2
+      --temp_dir "$BUILD_DIR/_tmp_compile_${kernel_name}" \
+      -o "$xo_file" "$src_file"
+  elif [[ ! -f "$xo_file" ]]; then
+    echo "Missing xo for link stage: $xo_file" >&2
     exit 1
   fi
 done
 
 if [[ "$BUILD_STAGE" == "compile" ]]; then
-  echo "Kernel compilation completed in: $BUILD_DIR"
+  echo "Compile only done: $BUILD_DIR"
   echo "Compile frequency target: ${COMPILE_FREQUENCY_MHZ} MHz"
   exit 0
 fi
@@ -88,12 +89,6 @@ v++ -l -t "$TARGET" --platform "$PLATFORM" \
   --save-temps \
   "${LINK_CFG_ARGS[@]}" \
   -o "$XCLBIN_FILE" "${XO_FILES[@]}"
-
-if [[ "$TARGET" == "sw_emu" || "$TARGET" == "hw_emu" ]]; then
-  if command -v emconfigutil >/dev/null 2>&1; then
-    (cd "$BUILD_DIR" && emconfigutil --platform "$PLATFORM" --nd 1)
-  fi
-fi
 
 echo "Built xclbin: $XCLBIN_FILE"
 echo "Compile frequency target: ${COMPILE_FREQUENCY_MHZ} MHz"

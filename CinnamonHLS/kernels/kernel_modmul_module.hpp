@@ -4,7 +4,7 @@
 
 namespace cinnamon_hls_kernel {
 
-inline std::uint32_t resolve_montgomery_operand_handle(
+inline std::uint32_t resolve_modmul_operand_handle(
     const std::uint64_t *control, const PayloadLayout &layout,
     const std::uint32_t *register_handles, const DecodedInstruction &inst,
     bool use_src1, std::uint32_t &status) {
@@ -34,7 +34,7 @@ inline std::uint32_t resolve_montgomery_operand_handle(
   return handle_id;
 }
 
-inline void execute_montgomery_module(const std::uint64_t *instructions,
+inline void execute_modmul_module(const std::uint64_t *instructions,
                                       std::uint64_t *control,
                                       std::uint64_t *payload,
                                       std::uint64_t *outputs,
@@ -54,7 +54,7 @@ inline void execute_montgomery_module(const std::uint64_t *instructions,
     constexpr std::uint32_t kEmptyRegisters = 0U;
     std::uint32_t empty_state[1] = {0U};
     write_payload_module_outputs(outputs, output_count, status, empty_state,
-                                 kEmptyRegisters, kModuleMontgomery,
+                                 kEmptyRegisters, kModuleModmul,
                                  partition_id, 0U);
     return;
   }
@@ -65,7 +65,7 @@ inline void execute_montgomery_module(const std::uint64_t *instructions,
   std::uint32_t register_handles[kMaxRegisters];
 #pragma HLS BIND_STORAGE variable = register_handles type = ram_2p impl = bram
   for (std::uint32_t i = 0; i < bounded_register_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     register_handles[i] = static_cast<std::uint32_t>(
         control[layout.register_handles_offset + i]);
   }
@@ -75,16 +75,16 @@ inline void execute_montgomery_module(const std::uint64_t *instructions,
   std::uint32_t executed = 0U;
   for (std::uint32_t i = 0; i < instruction_count; ++i) {
     const DecodedInstruction inst = decode_instruction(instructions, i);
-    if (!is_montgomery_opcode(inst.opcode)) {
+    if (!is_modmul_opcode(inst.opcode)) {
       continue;
     }
 
-    const std::uint32_t src0_handle = resolve_montgomery_operand_handle(
+    const std::uint32_t src0_handle = resolve_modmul_operand_handle(
         control, layout, register_handles, inst, false, status);
     if (status != kPayloadStatusOk) {
       break;
     }
-    const std::uint32_t src1_handle = resolve_montgomery_operand_handle(
+    const std::uint32_t src1_handle = resolve_modmul_operand_handle(
         control, layout, register_handles, inst, true, status);
     if (status != kPayloadStatusOk) {
       break;
@@ -112,11 +112,14 @@ inline void execute_montgomery_module(const std::uint64_t *instructions,
     const std::uint32_t out_offset =
         payload_handle_coeff_offset(layout, out_handle);
 
+    const std::uint64_t mu = lookup_barrett_mu(mod);
     for (std::uint32_t coeff = 0; coeff < layout.coeff_count; ++coeff) {
-#pragma HLS PIPELINE II = 1
-      const std::uint64_t a = payload[src0_offset + coeff] % mod;
-      const std::uint64_t b = payload[src1_offset + coeff] % mod;
-      payload[out_offset + coeff] = mod_mul(a, b, mod);
+#pragma HLS PIPELINE II = 4
+      const std::uint64_t a =
+          mod_reduce_precomputed(payload[src0_offset + coeff], mod, mu);
+      const std::uint64_t b =
+          mod_reduce_precomputed(payload[src1_offset + coeff], mod, mu);
+      payload[out_offset + coeff] = mod_mul_reduced_precomputed(a, b, mod, mu);
     }
 
     if (bounded_register_count != 0U) {
@@ -126,12 +129,12 @@ inline void execute_montgomery_module(const std::uint64_t *instructions,
   }
 
   for (std::uint32_t i = 0; i < bounded_register_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     control[layout.register_handles_offset + i] = register_handles[i];
   }
 
   write_payload_module_outputs(outputs, output_count, status, register_handles,
-                               bounded_register_count, kModuleMontgomery,
+                               bounded_register_count, kModuleModmul,
                                partition_id, executed);
 }
 

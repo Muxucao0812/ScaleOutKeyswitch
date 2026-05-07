@@ -51,7 +51,7 @@ enum Opcode : std::uint32_t {
 enum ModuleId : std::uint32_t {
   kModuleMemory = 1,
   kModuleArithmetic = 2,
-  kModuleMontgomery = 3,
+  kModuleModmul = 3,
   kModuleNtt = 4,
   kModuleBaseConv = 5,
   kModuleAutomorphism = 6,
@@ -78,35 +78,180 @@ inline std::uint64_t hash_mix(std::uint64_t v) {
   return v;
 }
 
-inline std::uint64_t mod_add(std::uint64_t a, std::uint64_t b,
-                             std::uint64_t mod) {
-  if (mod == 0U) {
-    return 0U;
+inline std::uint64_t lookup_barrett_mu(std::uint64_t mod) {
+  switch (mod) {
+    case 786433ULL: return 23456218233097ULL;
+    case 1179649ULL: return 15637485450086ULL;
+    case 2752513ULL: return 6701782724989ULL;
+    case 5767169ULL: return 3198578726184ULL;
+    case 6946817ULL: return 2655423926340ULL;
+    case 204865537ULL: return 90043178290ULL;
+    case 205651969ULL: return 89698844914ULL;
+    case 206307329ULL: return 89413905764ULL;
+    case 207880193ULL: return 88737381890ULL;
+    case 209059841ULL: return 88236669393ULL;
+    case 210370561ULL: return 87686908215ULL;
+    case 211025921ULL: return 87414588626ULL;
+    case 211812353ULL: return 87090029511ULL;
+    case 214171649ULL: return 86130653426ULL;
+    case 215482369ULL: return 85606744344ULL;
+    case 215744513ULL: return 85502726429ULL;
+    case 216137729ULL: return 85347172652ULL;
+    case 216924161ULL: return 85037756922ULL;
+    case 217317377ULL: return 84883888846ULL;
+    case 218628097ULL: return 84374992632ULL;
+    case 219676673ULL: return 83972248039ULL;
+    case 220594177ULL: return 83622987354ULL;
+    case 221249537ULL: return 83375288933ULL;
+    case 222035969ULL: return 83079980945ULL;
+    case 222167041ULL: return 83030966207ULL;
+    case 222953473ULL: return 82738088021ULL;
+    case 223215617ULL: return 82640920566ULL;
+    case 224002049ULL: return 82350782754ULL;
+    case 224133121ULL: return 82302624401ULL;
+    case 225574913ULL: return 81776576253ULL;
+    case 228065281ULL: return 80883613642ULL;
+    case 228458497ULL: return 80744399161ULL;
+    case 228720641ULL: return 80651855438ULL;
+    case 230424577ULL: return 80055453779ULL;
+    case 230686721ULL: return 79964481673ULL;
+    case 230817793ULL: return 79919073109ULL;
+    case 231473153ULL: return 79692801668ULL;
+    case 232390657ULL: return 79378165679ULL;
+    case 232652801ULL: return 79288725493ULL;
+    case 234356737ULL: return 78712241473ULL;
+    case 235798529ULL: return 78230954840ULL;
+    case 236584961ULL: return 77970907346ULL;
+    case 236716033ULL: return 77927734086ULL;
+    case 239337473ULL: return 77074199215ULL;
+    case 239861761ULL: return 76905731021ULL;
+    case 240648193ULL: return 76654405103ULL;
+    case 241827841ULL: return 76280481177ULL;
+    case 244842497ULL: return 75341267548ULL;
+    case 244973569ULL: return 75300956544ULL;
+    case 245235713ULL: return 75220463806ULL;
+    case 245760001ULL: return 75059993484ULL;
+    case 246415361ULL: return 74860365842ULL;
+    case 249561089ULL: return 73916747789ULL;
+    case 253100033ULL: return 72883214810ULL;
+    case 253493249ULL: return 72770159152ULL;
+    case 254279681ULL: return 72545096805ULL;
+    case 256376833ULL: return 71951680882ULL;
+    case 256770049ULL: return 71841494541ULL;
+    case 257949697ULL: return 71512951122ULL;
+    case 258605057ULL: return 71331722154ULL;
+    case 260571137ULL: return 70793504937ULL;
+    case 260702209ULL: return 70757912426ULL;
+    case 261488641ULL: return 70545106675ULL;
+    case 261881857ULL: return 70439183092ULL;
+    case 263323649ULL: return 70053503146ULL;
+    case 263454721ULL: return 70018650657ULL;
+    case 264634369ULL: return 69706531859ULL;
+    case 265420801ULL: return 69499993987ULL;
+    case 268042241ULL: return 68820287447ULL;
+    default: return 0U;
   }
-  const std::uint64_t aa = a % mod;
-  const std::uint64_t bb = b % mod;
-  const std::uint64_t s = aa + bb;
-  return (s >= mod) ? (s - mod) : s;
 }
 
-inline std::uint64_t mod_sub(std::uint64_t a, std::uint64_t b,
-                             std::uint64_t mod) {
-  if (mod == 0U) {
+// Barrett reduction: compute  value % mod  using precomputed mu = floor(2^64 / mod).
+// All moduli are < 2^32. The multiplication  value * mu  is decomposed into
+// four 32x32 multiplies that map directly to DSP48 slices and form natural
+// pipeline stages, replacing the previous __uint128_t monolithic multiply.
+// Marked INLINE off so HLS builds an independent pipelined block instead of
+// flattening the long combinational chain into the caller's loop.
+inline std::uint64_t mod_reduce_precomputed(std::uint64_t value,
+                                            std::uint64_t mod,
+                                            std::uint64_t mu) {
+#pragma HLS INLINE off
+#pragma HLS PIPELINE II = 8
+  if (mod <= 1U) {
     return 0U;
   }
-  const std::uint64_t aa = a % mod;
-  const std::uint64_t bb = b % mod;
-  return (aa >= bb) ? (aa - bb) : (aa + (mod - bb));
+  if (mu == 0U) {
+    return 0U;
+  }
+  // Split value and mu into 32-bit halves.
+  const std::uint32_t v_lo = static_cast<std::uint32_t>(value);
+  const std::uint32_t v_hi = static_cast<std::uint32_t>(value >> 32);
+  const std::uint32_t m_lo = static_cast<std::uint32_t>(mu);
+  const std::uint32_t m_hi = static_cast<std::uint32_t>(mu >> 32);
+
+  // Stage 1: four independent 32x32 multiplies (map to DSP48).
+  const std::uint64_t p0 = static_cast<std::uint64_t>(v_lo) * m_lo;  // LL
+  const std::uint64_t p1 = static_cast<std::uint64_t>(v_lo) * m_hi;  // LH
+  const std::uint64_t p2 = static_cast<std::uint64_t>(v_hi) * m_lo;  // HL
+  const std::uint64_t p3 = static_cast<std::uint64_t>(v_hi) * m_hi;  // HH
+
+  // Stage 2: combine — (value * mu) >> 64 = p3 + carry
+  const std::uint64_t sum_lo = p1 + p2 + (p0 >> 32);
+  const std::uint64_t q = p3 + (sum_lo >> 32);
+
+  // Stage 3: remainder r = value - q * mod, with at most 3 corrections.
+  // q < 2^30 and mod < 2^29 (both fit in 32 bits), so q * mod < 2^59 fits in
+  // 64 bits.  The 32x32 multiply maps to a single DSP48.
+  const std::uint32_t m32 = static_cast<std::uint32_t>(mod);
+  const std::uint64_t qm =
+      static_cast<std::uint64_t>(static_cast<std::uint32_t>(q)) * m32;
+  std::uint64_t r = value - qm;
+  if (r >= mod) {
+    r -= mod;
+  }
+  if (r >= mod) {
+    r -= mod;
+  }
+  if (r >= mod) {
+    r -= mod;
+  }
+  return r;
 }
 
-inline std::uint64_t mod_mul(std::uint64_t a, std::uint64_t b,
-                             std::uint64_t mod) {
+inline std::uint64_t mod_reduce(std::uint64_t value, std::uint64_t mod) {
+  return mod_reduce_precomputed(value, mod, lookup_barrett_mu(mod));
+}
+
+// Reduced-domain helpers: callers guarantee a,b < mod.
+inline std::uint64_t mod_add_reduced_precomputed(std::uint64_t a,
+                                                 std::uint64_t b,
+                                                 std::uint64_t mod,
+                                                 std::uint64_t /* mu */) {
   if (mod == 0U) {
     return 0U;
   }
-  const __uint128_t p = static_cast<__uint128_t>(a % mod) *
-                        static_cast<__uint128_t>(b % mod);
-  return static_cast<std::uint64_t>(p % mod);
+  const std::uint32_t aa = static_cast<std::uint32_t>(a);
+  const std::uint32_t bb = static_cast<std::uint32_t>(b);
+  const std::uint32_t qq = static_cast<std::uint32_t>(mod);
+  const std::uint32_t s = aa + bb;
+  return (s >= qq) ? static_cast<std::uint64_t>(s - qq)
+                   : static_cast<std::uint64_t>(s);
+}
+
+// Reduced-domain helpers: callers guarantee a,b < mod.
+inline std::uint64_t mod_sub_reduced_precomputed(std::uint64_t a,
+                                                 std::uint64_t b,
+                                                 std::uint64_t mod,
+                                                 std::uint64_t /* mu */) {
+  if (mod == 0U) {
+    return 0U;
+  }
+  const std::uint32_t aa = static_cast<std::uint32_t>(a);
+  const std::uint32_t bb = static_cast<std::uint32_t>(b);
+  const std::uint32_t qq = static_cast<std::uint32_t>(mod);
+  return (aa >= bb) ? static_cast<std::uint64_t>(aa - bb)
+                    : static_cast<std::uint64_t>(aa + (qq - bb));
+}
+
+// Reduced-domain helpers: callers guarantee a,b < mod.
+inline std::uint64_t mod_mul_reduced_precomputed(std::uint64_t a,
+                                                 std::uint64_t b,
+                                                 std::uint64_t mod,
+                                                 std::uint64_t mu) {
+  if (mod == 0U) {
+    return 0U;
+  }
+  const std::uint64_t p =
+      static_cast<std::uint64_t>(static_cast<std::uint32_t>(a)) *
+      static_cast<std::uint64_t>(static_cast<std::uint32_t>(b));
+  return mod_reduce_precomputed(p, mod, mu);
 }
 
 inline std::uint64_t mod_pow(std::uint64_t base, std::uint64_t exponent,
@@ -114,14 +259,15 @@ inline std::uint64_t mod_pow(std::uint64_t base, std::uint64_t exponent,
   if (mod == 0U) {
     return 0U;
   }
+  const std::uint64_t mu = lookup_barrett_mu(mod);
   std::uint64_t acc = 1U;
-  std::uint64_t b = base % mod;
+  std::uint64_t b = mod_reduce_precomputed(base, mod, mu);
   std::uint64_t e = exponent;
   while (e != 0U) {
     if ((e & 1U) != 0U) {
-      acc = mod_mul(acc, b, mod);
+      acc = mod_mul_reduced_precomputed(acc, b, mod, mu);
     }
-    b = mod_mul(b, b, mod);
+    b = mod_mul_reduced_precomputed(b, b, mod, mu);
     e >>= 1U;
   }
   return acc;
@@ -134,7 +280,9 @@ inline std::uint64_t mod_inv(std::uint64_t a, std::uint64_t mod) {
   std::int64_t t = 0;
   std::int64_t new_t = 1;
   std::int64_t r = static_cast<std::int64_t>(mod);
-  std::int64_t new_r = static_cast<std::int64_t>(a % mod);
+  const std::uint64_t mu = lookup_barrett_mu(mod);
+  std::int64_t new_r =
+      static_cast<std::int64_t>(mod_reduce_precomputed(a, mod, mu));
 
   while (new_r != 0) {
     const std::int64_t q = r / new_r;
@@ -158,28 +306,6 @@ inline std::uint64_t mod_inv(std::uint64_t a, std::uint64_t mod) {
   return static_cast<std::uint64_t>(reduced);
 }
 
-inline std::uint64_t montgomery_reduce_ntt_friendly(std::uint64_t a,
-                                                    std::uint64_t q) {
-  if (q == 0U) {
-    return 0U;
-  }
-  constexpr std::uint32_t kOneIterLog2 = 17U;
-  constexpr std::uint32_t kNumIterations = 2U;
-  constexpr std::uint64_t kR = (1ULL << (kOneIterLog2 * kNumIterations));
-  const std::uint64_t r_mod_q = kR % q;
-  const std::uint64_t r_inv = mod_inv(r_mod_q, q);
-  if (r_inv == 0U) {
-    return a % q;
-  }
-  return mod_mul(a % q, r_inv, q);
-}
-
-inline std::uint64_t montgomery_mul_ntt_friendly(std::uint64_t a,
-                                                 std::uint64_t b,
-                                                 std::uint64_t q) {
-  return montgomery_reduce_ntt_friendly(mod_mul(a, b, q), q);
-}
-
 inline std::int64_t sign_extend_32(std::uint64_t value) {
   const std::uint32_t lo = static_cast<std::uint32_t>(value & 0xFFFFFFFFULL);
   return static_cast<std::int64_t>(static_cast<std::int32_t>(lo));
@@ -189,10 +315,12 @@ inline std::uint64_t signed_mod(std::int64_t value, std::uint64_t mod) {
   if (mod == 0U) {
     return 0U;
   }
+  const std::uint64_t mu = lookup_barrett_mu(mod);
   if (value >= 0) {
-    return static_cast<std::uint64_t>(value) % mod;
+    return mod_reduce_precomputed(static_cast<std::uint64_t>(value), mod, mu);
   }
-  const std::uint64_t mag = static_cast<std::uint64_t>(-value) % mod;
+  const std::uint64_t mag =
+      mod_reduce_precomputed(static_cast<std::uint64_t>(-value), mod, mu);
   return (mag == 0U) ? 0U : (mod - mag);
 }
 
@@ -261,13 +389,13 @@ inline std::uint64_t lookup_stream_value(const std::uint64_t *inputs,
   std::uint32_t lo = 0U;
   std::uint32_t hi = table_count;
   while (lo < hi) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     const std::uint32_t mid = lo + ((hi - lo) >> 1U);
     const std::uint32_t cursor = table_base + 1U + (mid << 1U);
     const std::uint64_t key = inputs[cursor];
     if (key == token_key) {
       const std::uint64_t value = inputs[cursor + 1U];
-      return (mod == 0U) ? 0U : (value % mod);
+      return mod_reduce(value, mod);
     }
     if (key < token_key) {
       lo = mid + 1U;
@@ -301,7 +429,7 @@ inline std::uint64_t load_operand(const std::uint64_t *state,
   if (register_count == 0U) {
     return 0U;
   }
-  return (mod == 0U) ? 0U : (state[src % register_count] % mod);
+  return mod_reduce(state[src % register_count], mod);
 }
 
 inline void store_register(std::uint64_t *state,
@@ -312,7 +440,7 @@ inline void store_register(std::uint64_t *state,
   if (register_count == 0U) {
     return;
   }
-  state[dst % register_count] = (mod == 0U) ? 0U : (value % mod);
+  state[dst % register_count] = mod_reduce(value, mod);
 }
 
 inline std::uint64_t compute_trace(const std::uint64_t *state,
@@ -322,7 +450,7 @@ inline std::uint64_t compute_trace(const std::uint64_t *state,
   std::uint64_t acc = 0x9E3779B97F4A7C15ULL ^ static_cast<std::uint64_t>(module_id);
   acc ^= static_cast<std::uint64_t>(executed) << 16U;
   for (std::uint32_t i = 0; i < register_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     acc ^= hash_mix(state[i] ^ static_cast<std::uint64_t>(i + 1U));
     acc = rotl64(acc, 7U);
   }
@@ -362,11 +490,11 @@ inline void write_module_outputs(std::uint64_t *outputs,
       (state_words_available < register_count) ? state_words_available : register_count;
 
   for (std::uint32_t i = 0; i < words_to_copy; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     outputs[kOutputHeaderWords + i] = state[i];
   }
   for (std::uint32_t i = words_to_copy; i < state_words_available; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     outputs[kOutputHeaderWords + i] = 0ULL;
   }
 }
@@ -392,9 +520,9 @@ inline void init_state_from_input(const std::uint64_t *inputs,
                                   std::uint64_t mod,
                                   std::uint32_t state_base) {
   for (std::uint32_t i = 0; i < bounded_register_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     const std::uint32_t idx = state_base + i;
-    state[i] = (idx < input_count) ? ((mod == 0U) ? 0U : (inputs[idx] % mod)) : 0ULL;
+    state[i] = (idx < input_count) ? mod_reduce(inputs[idx], mod) : 0ULL;
   }
 }
 
@@ -442,12 +570,12 @@ inline std::uint64_t lookup_ntt_twiddle(std::uint64_t mod,
   for (const auto &tbl : kTables) {
     if (tbl.mod == mod && tbl.prime_id == prime_id && tbl.inverse == inverse &&
         tbl.size == want_size) {
-      return select_twiddle(tbl, exponent) % mod;
+      return mod_reduce(select_twiddle(tbl, exponent), mod);
     }
   }
   for (const auto &tbl : kTables) {
     if (tbl.mod == mod && tbl.prime_id == prime_id && tbl.inverse == inverse) {
-      return select_twiddle(tbl, exponent) % mod;
+      return mod_reduce(select_twiddle(tbl, exponent), mod);
     }
   }
 
@@ -472,13 +600,13 @@ inline NegacyclicRoots resolve_negacyclic_roots(std::uint64_t mod,
                                                 std::uint32_t prime_id) {
   NegacyclicRoots roots{};
   for (std::size_t i = 0; i < kNegacyclicRootTableSize; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     const auto &entry = kNegacyclicRootTable[i];
     if (entry.mod == mod && entry.span == span) {
-      roots.psi = entry.psi % mod;
-      roots.psi_inv = entry.psi_inv % mod;
-      roots.omega = entry.omega % mod;
-      roots.omega_inv = entry.omega_inv % mod;
+      roots.psi = mod_reduce(entry.psi, mod);
+      roots.psi_inv = mod_reduce(entry.psi_inv, mod);
+      roots.omega = mod_reduce(entry.omega, mod);
+      roots.omega_inv = mod_reduce(entry.omega_inv, mod);
       roots.from_table = true;
       return roots;
     }
@@ -486,7 +614,7 @@ inline NegacyclicRoots resolve_negacyclic_roots(std::uint64_t mod,
   // Compatibility fallback for unexpected modulus/span pairs.
   const std::uint64_t fallback_omega =
       lookup_ntt_twiddle(mod, prime_id, false, 1U, span);
-  roots.omega = (mod == 0U) ? 1U : (fallback_omega % mod);
+  roots.omega = (mod == 0U) ? 1U : mod_reduce(fallback_omega, mod);
   roots.omega_inv = mod_inv(roots.omega, mod);
   if (roots.omega_inv == 0U) {
     roots.omega_inv = 1U;
@@ -508,17 +636,20 @@ inline void small_cyclic_dft(const std::uint64_t *input,
                              std::uint32_t length,
                              std::uint64_t root,
                              std::uint64_t mod) {
+#pragma HLS INLINE off
   if (length == 0U) {
     return;
   }
+  const std::uint64_t mu = lookup_barrett_mu(mod);
   for (std::uint32_t k = 0U; k < length; ++k) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     const std::uint64_t step = mod_pow(root, k, mod);
     std::uint64_t tw = 1U;
     std::uint64_t acc = 0U;
     for (std::uint32_t n = 0U; n < length; ++n) {
-      acc = mod_add(acc, mod_mul(input[n], tw, mod), mod);
-      tw = mod_mul(tw, step, mod);
+      acc = mod_add_reduced_precomputed(
+          acc, mod_mul_reduced_precomputed(input[n], tw, mod, mu), mod, mu);
+      tw = mod_mul_reduced_precomputed(tw, step, mod, mu);
     }
     output[k] = acc;
   }
@@ -529,9 +660,47 @@ inline void cyclic_ntt_four_step(std::uint64_t *values,
                                  std::uint64_t omega,
                                  std::uint64_t mod,
                                  bool inverse_cyclic) {
+#pragma HLS INLINE off
   constexpr std::uint32_t kMaxSpan = 128U;
   constexpr std::uint32_t kMaxFourStepSide = 16U;
-  if (span < 2U || span > kMaxSpan || mod == 0U) {
+  if (span < 2U || mod == 0U || !is_power_of_two(span)) {
+    return;
+  }
+
+  if (span > kMaxSpan) {
+    const std::uint64_t mu = lookup_barrett_mu(mod);
+    for (std::uint32_t half = 1U; half < span; half <<= 1U) {
+      const std::uint32_t full = half << 1U;
+      const std::uint64_t stage_root = mod_pow(omega, span / full, mod);
+      for (std::uint32_t base = 0U; base < span; base += full) {
+        std::uint64_t twiddle = 1U;
+        for (std::uint32_t j = 0U; j < half; ++j) {
+#pragma HLS PIPELINE II = 4
+          const std::uint32_t lo = base + j;
+          const std::uint32_t hi = lo + half;
+          const std::uint64_t u =
+              mod_reduce_precomputed(values[lo], mod, mu);
+          const std::uint64_t v = mod_mul_reduced_precomputed(
+              mod_reduce_precomputed(values[hi], mod, mu),
+              twiddle, mod, mu);
+          values[lo] = mod_add_reduced_precomputed(u, v, mod, mu);
+          values[hi] = mod_sub_reduced_precomputed(u, v, mod, mu);
+          twiddle =
+              mod_mul_reduced_precomputed(twiddle, stage_root, mod, mu);
+        }
+      }
+    }
+
+    if (inverse_cyclic) {
+      const std::uint64_t span_inv = mod_inv(span, mod);
+      if (span_inv != 0U) {
+        for (std::uint32_t i = 0U; i < span; ++i) {
+#pragma HLS PIPELINE II = 4
+          values[i] = mod_mul_reduced_precomputed(
+              mod_reduce_precomputed(values[i], mod, mu), span_inv, mod, mu);
+        }
+      }
+    }
     return;
   }
 
@@ -546,23 +715,21 @@ inline void cyclic_ntt_four_step(std::uint64_t *values,
   std::uint64_t stage2[kMaxSpan];
   std::uint64_t lane_in[kMaxFourStepSide];
   std::uint64_t lane_out[kMaxFourStepSide];
-#pragma HLS ARRAY_PARTITION variable = stage1 cyclic factor = 8
-#pragma HLS ARRAY_PARTITION variable = stage2 cyclic factor = 8
-#pragma HLS ARRAY_PARTITION variable = lane_in complete
-#pragma HLS ARRAY_PARTITION variable = lane_out complete
+// ARRAY_PARTITION removed to reduce parallelism and ease routing
 
+  const std::uint64_t mu = lookup_barrett_mu(mod);
   const std::uint64_t row_root = mod_pow(omega, rows, mod);
   const std::uint64_t col_root = mod_pow(omega, cols, mod);
 
   // Stage 1: C-point transforms over n2 with x[n1 + R*n2] mapping.
   for (std::uint32_t n1 = 0U; n1 < rows; ++n1) {
     for (std::uint32_t n2 = 0U; n2 < cols; ++n2) {
-#pragma HLS PIPELINE II = 1
-      lane_in[n2] = values[n1 + rows * n2] % mod;
+#pragma HLS PIPELINE II = 4
+      lane_in[n2] = mod_reduce_precomputed(values[n1 + rows * n2], mod, mu);
     }
     small_cyclic_dft(lane_in, lane_out, cols, row_root, mod);
     for (std::uint32_t k2 = 0U; k2 < cols; ++k2) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
       stage1[n1 * cols + k2] = lane_out[k2];
     }
   }
@@ -572,17 +739,17 @@ inline void cyclic_ntt_four_step(std::uint64_t *values,
     std::uint64_t tw = 1U;
     const std::uint64_t step = mod_pow(omega, n1, mod);
     for (std::uint32_t k2 = 0U; k2 < cols; ++k2) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
       const std::uint32_t idx = n1 * cols + k2;
-      stage1[idx] = mod_mul(stage1[idx], tw, mod);
-      tw = mod_mul(tw, step, mod);
+      stage1[idx] = mod_mul_reduced_precomputed(stage1[idx], tw, mod, mu);
+      tw = mod_mul_reduced_precomputed(tw, step, mod, mu);
     }
   }
 
   // Stage 3: explicit transpose to C x R.
   for (std::uint32_t n1 = 0U; n1 < rows; ++n1) {
     for (std::uint32_t k2 = 0U; k2 < cols; ++k2) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
       stage2[k2 * rows + n1] = stage1[n1 * cols + k2];
     }
   }
@@ -590,12 +757,12 @@ inline void cyclic_ntt_four_step(std::uint64_t *values,
   // Stage 4: R-point transforms over n1, write k = k2 + C*k1.
   for (std::uint32_t k2 = 0U; k2 < cols; ++k2) {
     for (std::uint32_t n1 = 0U; n1 < rows; ++n1) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
       lane_in[n1] = stage2[k2 * rows + n1];
     }
     small_cyclic_dft(lane_in, lane_out, rows, col_root, mod);
     for (std::uint32_t k1 = 0U; k1 < rows; ++k1) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
       values[k2 + cols * k1] = lane_out[k1];
     }
   }
@@ -604,41 +771,32 @@ inline void cyclic_ntt_four_step(std::uint64_t *values,
     const std::uint64_t span_inv = mod_inv(span, mod);
     if (span_inv != 0U) {
       for (std::uint32_t i = 0U; i < span; ++i) {
-#pragma HLS PIPELINE II = 1
-        values[i] = mod_mul(values[i], span_inv, mod);
+#pragma HLS PIPELINE II = 4
+        values[i] = mod_mul_reduced_precomputed(values[i], span_inv, mod, mu);
       }
     }
   }
 }
 
 inline void bit_reverse_permute(std::uint64_t *values, std::uint32_t span) {
-  constexpr std::uint32_t kMaxSpan = 128U;
-  if (span < 2U || span > kMaxSpan || !is_power_of_two(span)) {
+  if (span < 2U || !is_power_of_two(span)) {
     return;
   }
 
-  std::uint64_t scratch[kMaxSpan];
-#pragma HLS ARRAY_PARTITION variable = scratch cyclic factor = 8
-
-  std::uint32_t bit_count = 0U;
-  while ((1U << bit_count) < span) {
-    ++bit_count;
-  }
-
-  for (std::uint32_t i = 0U; i < span; ++i) {
-#pragma HLS PIPELINE II = 1
-    std::uint32_t x = i;
-    std::uint32_t reversed = 0U;
-    for (std::uint32_t b = 0U; b < bit_count; ++b) {
-      reversed = (reversed << 1U) | (x & 0x1U);
-      x >>= 1U;
+  std::uint32_t j = 0U;
+  for (std::uint32_t i = 1U; i < span; ++i) {
+    std::uint32_t bit = span >> 1U;
+    while ((j & bit) != 0U) {
+      j ^= bit;
+      bit >>= 1U;
     }
-    scratch[reversed] = values[i];
-  }
-
-  for (std::uint32_t i = 0U; i < span; ++i) {
-#pragma HLS PIPELINE II = 1
-    values[i] = scratch[i];
+    j ^= bit;
+    if (i < j) {
+#pragma HLS PIPELINE II = 4
+      const std::uint64_t tmp = values[i];
+      values[i] = values[j];
+      values[j] = tmp;
+    }
   }
 }
 
@@ -647,18 +805,21 @@ inline void ntt_apply_negacyclic_four_step(std::uint64_t *values,
                                            std::uint64_t mod,
                                            std::uint32_t prime_id,
                                            bool inverse) {
+#pragma HLS INLINE off
   if (span < 2U || mod == 0U || !is_power_of_two(span)) {
     return;
   }
+  const std::uint64_t mu = lookup_barrett_mu(mod);
   const NegacyclicRoots roots = resolve_negacyclic_roots(mod, span, prime_id);
 
   if (!inverse) {
     // Pre-twist by psi^i before cyclic NTT(omega = psi^2).
     std::uint64_t twist = 1U;
     for (std::uint32_t i = 0U; i < span; ++i) {
-#pragma HLS PIPELINE II = 1
-      values[i] = mod_mul(values[i] % mod, twist, mod);
-      twist = mod_mul(twist, roots.psi, mod);
+#pragma HLS PIPELINE II = 4
+      values[i] = mod_mul_reduced_precomputed(
+          mod_reduce_precomputed(values[i], mod, mu), twist, mod, mu);
+      twist = mod_mul_reduced_precomputed(twist, roots.psi, mod, mu);
     }
     cyclic_ntt_four_step(values, span, roots.omega, mod, false);
     bit_reverse_permute(values, span);
@@ -670,9 +831,10 @@ inline void ntt_apply_negacyclic_four_step(std::uint64_t *values,
   cyclic_ntt_four_step(values, span, roots.omega_inv, mod, true);
   std::uint64_t twist = 1U;
   for (std::uint32_t i = 0U; i < span; ++i) {
-#pragma HLS PIPELINE II = 1
-    values[i] = mod_mul(values[i] % mod, twist, mod);
-    twist = mod_mul(twist, roots.psi_inv, mod);
+#pragma HLS PIPELINE II = 4
+    values[i] = mod_mul_reduced_precomputed(
+        mod_reduce_precomputed(values[i], mod, mu), twist, mod, mu);
+    twist = mod_mul_reduced_precomputed(twist, roots.psi_inv, mod, mu);
   }
 }
 
@@ -717,7 +879,7 @@ inline std::uint32_t reverse_bits_u32(std::uint32_t value,
                                       std::uint32_t bit_count) {
   std::uint32_t reversed = 0U;
   for (std::uint32_t i = 0U; i < bit_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     reversed = (reversed << 1U) | ((value >> i) & 0x1U);
   }
   return reversed;
@@ -754,7 +916,7 @@ inline std::uint32_t galois_elt_from_step(std::uint32_t coeff_count,
   constexpr std::uint64_t kGenerator = 5ULL;
   std::uint64_t galois_elt = 1ULL;
   while (adjusted_step-- > 0) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     galois_elt *= kGenerator;
     galois_elt &= (m - 1ULL);
   }
@@ -773,7 +935,7 @@ inline void apply_galois_ntt_permutation(const std::uint64_t *operand,
   const std::uint32_t coeff_count_power = ilog2_pow2(coeff_count);
   const std::uint32_t coeff_count_minus_one = coeff_count - 1U;
   for (std::uint32_t k = 0U; k < coeff_count; ++k) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     const std::uint32_t i = coeff_count + k;
     const std::uint32_t reversed =
         reverse_bits_u32(i, coeff_count_power + 1U);
@@ -824,11 +986,10 @@ inline void apply_benes_network(std::uint64_t *values,
   const std::uint64_t perm_mask = automorphism_perm_info_mask(size);
   const std::uint64_t perm = perm_bits & perm_mask;
   std::uint64_t scratch[kMaxBenesSize];
-#pragma HLS ARRAY_PARTITION variable = scratch cyclic factor = 8
 
   for (std::uint32_t level = 0U; level < 2U * levels; ++level) {
     for (std::uint32_t i = 0U; i < size; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
       scratch[i] = values[i];
     }
     const std::uint64_t layer =
@@ -840,7 +1001,7 @@ inline void apply_benes_network(std::uint64_t *values,
 
     for (std::uint32_t block_id = 0U; block_id < block_num; ++block_id) {
       for (std::uint32_t i = 0U; i < half_block; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
         const std::uint32_t perm_idx = block_id * half_block + i;
         const bool do_swap = ((layer >> perm_idx) & 0x1ULL) != 0ULL;
         const std::uint32_t idx1 = block_id * block_size + i;
@@ -875,7 +1036,7 @@ inline void transpose_square_matrix(const std::uint64_t *in_matrix,
                                     std::uint32_t side) {
   for (std::uint32_t r = 0U; r < side; ++r) {
     for (std::uint32_t c = 0U; c < side; ++c) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
       out_matrix[c * side + r] = in_matrix[r * side + c];
     }
   }
@@ -890,7 +1051,6 @@ inline void apply_automorphism_matrix(std::uint64_t *matrix_words,
   std::uint64_t stage1[kMaxWords];
   std::uint64_t stage2[kMaxWords];
   std::uint64_t row_buf[kMaxSide];
-#pragma HLS ARRAY_PARTITION variable = row_buf cyclic factor = 8
 
   const std::uint64_t col_perm = sanitize_perm_info(col_perm_info, side);
   const std::uint64_t row_perm = sanitize_perm_info(row_perm_info, side);
@@ -898,12 +1058,12 @@ inline void apply_automorphism_matrix(std::uint64_t *matrix_words,
   // Stage 1: column permutation.
   for (std::uint32_t r = 0U; r < side; ++r) {
     for (std::uint32_t c = 0U; c < side; ++c) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
       row_buf[c] = matrix_words[r * side + c];
     }
     apply_benes_network(row_buf, side, col_perm);
     for (std::uint32_t c = 0U; c < side; ++c) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
       stage1[r * side + c] = row_buf[c];
     }
   }
@@ -914,12 +1074,12 @@ inline void apply_automorphism_matrix(std::uint64_t *matrix_words,
   // Stage 3: row permutation.
   for (std::uint32_t r = 0U; r < side; ++r) {
     for (std::uint32_t c = 0U; c < side; ++c) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
       row_buf[c] = stage2[r * side + c];
     }
     apply_benes_network(row_buf, side, row_perm);
     for (std::uint32_t c = 0U; c < side; ++c) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
       stage1[r * side + c] = row_buf[c];
     }
   }
@@ -956,7 +1116,7 @@ inline void transpose_full_stream(const std::uint64_t *in_cols,
   for (std::uint32_t i = 0U; i < col_size; ++i) {
     for (std::uint32_t j = 0U; j < col_size; ++j) {
       for (std::uint32_t k = 0U; k < ratio; ++k) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
         out_cols[j * row_size + i * ratio + k] =
             in_cols[i * row_size + j * ratio + k];
       }
@@ -975,7 +1135,7 @@ inline void transpose_network_permutation(const std::uint64_t *in_data,
   for (std::uint32_t block = 0U; block < col_size; ++block) {
     for (std::uint32_t src_id = 0U; src_id < cluster_num; ++src_id) {
       for (std::uint32_t src_elem = 0U; src_elem < cluster_num; ++src_elem) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
         const std::uint32_t dest_id = src_elem;
         const std::uint32_t dest_elem = src_id;
         out_data[dest_id * row_size + block * cluster_num + dest_elem] =
@@ -986,7 +1146,7 @@ inline void transpose_network_permutation(const std::uint64_t *in_data,
 }
 
 
-inline bool is_montgomery_opcode(std::uint32_t opcode) {
+inline bool is_modmul_opcode(std::uint32_t opcode) {
   return opcode == kOpMul || opcode == kOpMup || opcode == kOpMus;
 }
 

@@ -1,10 +1,10 @@
 #include <cstdint>
 
-#include "kernel_montgomery_module.hpp"
+#include "kernel_modmul_module.hpp"
 
 extern "C" {
 
-void cinnamon_montgomery(const std::uint64_t *instructions,
+void cinnamon_modmul(const std::uint64_t *instructions,
                          std::uint64_t *control_words,
                          std::uint64_t *payload_words,
                          std::uint64_t *outputs,
@@ -28,7 +28,7 @@ void cinnamon_montgomery(const std::uint64_t *instructions,
 #pragma HLS INTERFACE s_axilite port = partition_id bundle = control
 #pragma HLS INTERFACE s_axilite port = return bundle = control
 
-  cinnamon_hls_kernel::execute_montgomery_module(
+  cinnamon_hls_kernel::execute_modmul_module(
       instructions, control_words, payload_words, outputs, instruction_count,
       control_count, payload_count, output_count, partition_id);
 }

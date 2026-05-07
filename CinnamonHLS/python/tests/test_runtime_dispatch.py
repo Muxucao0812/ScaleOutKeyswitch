@@ -137,7 +137,7 @@ def test_runtime_dispatch_routes_all_modules(monkeypatch, tmp_path: pathlib.Path
 
     # Every compute module should be dispatched exactly once.
     assert sorted(dispatched_modules) == sorted(
-        ["memory", "arithmetic", "montgomery", "ntt", "base_conv", "automorphism"]
+        ["memory", "arithmetic", "modmul", "ntt", "base_conv", "automorphism"]
     )
 
     outputs = runtime.get_kernel_outputs()

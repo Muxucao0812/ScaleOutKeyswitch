@@ -623,6 +623,63 @@ def summarize_kernel_outputs(
     return partitions
 
 
+def build_hw_execution_proof(
+    *,
+    target: str,
+    outputs: Sequence[Dict[str, Any]],
+    output_sources: Dict[str, str],
+    timing_summary: Dict[str, Any],
+    payload_source_error: str = "",
+) -> Dict[str, Any]:
+    global_timing = dict(timing_summary.get("global", {}))
+    total_modules = 0
+    total_executed = 0
+    nonzero_status_modules: List[str] = []
+    missing_status_modules: List[str] = []
+
+    for partition in outputs:
+        partition_id = int(partition.get("partition_id", -1))
+        for module_result in list(partition.get("module_results", [])):
+            total_modules += 1
+            module_name = str(module_result.get("module", "unknown"))
+            status = module_result.get("status")
+            if status is None:
+                missing_status_modules.append(f"p{partition_id}:{module_name}")
+            elif int(status) != 0:
+                nonzero_status_modules.append(f"p{partition_id}:{module_name}:{int(status)}")
+            total_executed += int(module_result.get("executed", 0) or 0)
+
+    checks = {
+        "target_is_hw": str(target) == "hw",
+        "payload_source_readable": payload_source_error == "",
+        "outputs_from_fpga_payload": bool(output_sources) and all(
+            str(source) == "fpga_payload" for source in output_sources.values()
+        ),
+        "kernel_status_all_zero": not nonzero_status_modules and not missing_status_modules,
+        "kernel_executed_positive": int(total_executed) > 0,
+        "h2d_positive": float(global_timing.get("h2d_s", 0.0)) > 0.0,
+        "d2h_positive": float(global_timing.get("d2h_s", 0.0)) > 0.0,
+        "stage_count_positive": int(global_timing.get("stage_count", 0)) > 0,
+        "run_program_time_positive": float(global_timing.get("run_program_total_s", 0.0)) > 0.0,
+    }
+    failed_checks = [name for name, ok in checks.items() if not bool(ok)]
+
+    return {
+        "checks": checks,
+        "all_checks_passed": len(failed_checks) == 0,
+        "failed_checks": failed_checks,
+        "evidence": {
+            "output_sources": {str(k): str(v) for k, v in output_sources.items()},
+            "total_modules": int(total_modules),
+            "total_executed": int(total_executed),
+            "nonzero_status_modules": nonzero_status_modules[:64],
+            "missing_status_modules": missing_status_modules[:64],
+            "runtime_global": global_timing,
+            "payload_source_error": str(payload_source_error),
+        },
+    }
+
+
 def prepare_artifacts(
     *,
     chips: int,
@@ -793,6 +850,10 @@ def run_one_sample_fpga_only(
         verify_kernel_results=True,
     )
 
+    jsonl_log_path = pathlib.Path(artifact_info["out_dir"]) / f"sample_{int(sample_id)}_runtime.jsonl"
+    if not os.getenv("CINNAMON_FPGA_JSONL_LOG", "").strip():
+        os.environ["CINNAMON_FPGA_JSONL_LOG"] = str(jsonl_log_path)
+
     runtime.generate_and_serialize_evalkeys(evalkeys, program_inputs, encryptor)
     runtime.generate_inputs(program_inputs, evalkeys, raw_inputs, encryptor)
 
@@ -804,6 +865,35 @@ def run_one_sample_fpga_only(
     kernel_exec = summarize_kernel_execution(outputs)
     kernel_outputs_summary = summarize_kernel_outputs(outputs)
     timing_summary = dict(runtime.last_timing_summary)
+    output_ciphertexts: Dict[str, Dict[str, Any]] = {}
+    output_sources: Dict[str, str] = {}
+    payload_source_error = ""
+    try:
+        output_ciphertexts = dict(runtime.get_output_ciphertexts())
+        output_sources = {
+            str(name): str(payload.get("source", "unknown"))
+            for name, payload in output_ciphertexts.items()
+        }
+    except Exception as exc:
+        payload_source_error = str(exc)
+
+    hw_execution_proof = build_hw_execution_proof(
+        target=target,
+        outputs=outputs,
+        output_sources=output_sources,
+        timing_summary=timing_summary,
+        payload_source_error=payload_source_error,
+    )
+    hw_execution_proof_path = pathlib.Path(artifact_info["out_dir"]) / f"sample_{int(sample_id)}_hw_execution_proof.json"
+    hw_execution_proof_path.write_text(
+        json.dumps(hw_execution_proof, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    if str(target) == "hw" and not bool(hw_execution_proof.get("all_checks_passed", False)):
+        failed_checks = list(hw_execution_proof.get("failed_checks", []))
+        raise RuntimeError(
+            "HW execution proof checks failed: " + ", ".join(str(v) for v in failed_checks)
+        )
 
     decrypt_ok = False
     decrypt_error = ""
@@ -861,6 +951,8 @@ def run_one_sample_fpga_only(
         "kernel_outputs_summary": kernel_outputs_summary,
         "runtime_global": dict(timing_summary.get("global", {})),
         "runtime_stage": list(timing_summary.get("stage_timing", [])),
+        "output_sources": output_sources,
+        "hw_execution_proof": hw_execution_proof,
         "wall_run_program_s": float(t1 - t0),
         "artifacts": {
             "out_dir": str(artifact_info["out_dir"]),
@@ -868,6 +960,8 @@ def run_one_sample_fpga_only(
             "program_inputs": program_inputs,
             "evalkeys": evalkeys,
             "xclbin": str(xclbin),
+            "jsonl_log": str(jsonl_log_path),
+            "hw_execution_proof": str(hw_execution_proof_path),
         },
         "compile_info": {
             "compiled": bool(artifact_info["compiled"]),
@@ -1085,13 +1179,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="CPU encrypt -> FPGA compute -> CPU decrypt -> pred vs label"
     )
-    parser.add_argument("--target", choices=["sw_emu", "hw_emu", "hw"], default="sw_emu")
-    parser.add_argument("--xclbin", type=pathlib.Path, default=None)
+    parser.add_argument("--target", choices=["sw_emu", "hw_emu", "hw"], default="hw")
+    parser.add_argument("--xclbin", type=pathlib.Path, default=ROOT_DIR / "build" / "hw_50mhz" / "cinnamon_fpga.hw.xclbin",)
     parser.add_argument("--chips", default="1")
     parser.add_argument("--boards", default="0,1,2,3")
     parser.add_argument("--sample-id", type=int, default=10)
     parser.add_argument("--sample-start", type=int, default=1)
-    parser.add_argument("--sample-end", type=int, default=5)
+    parser.add_argument("--sample-end", type=int, default=1)
     parser.add_argument("--register-file-size", type=int, default=1024)
     parser.add_argument(
         "--pred-decode-mode",

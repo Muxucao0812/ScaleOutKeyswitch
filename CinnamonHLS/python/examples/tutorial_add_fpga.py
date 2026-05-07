@@ -94,10 +94,19 @@ def main() -> None:
     expected = [float(3 * i) for i in range(slots)]
     output_scales = {"z": float(scale)}
 
+    # runtime = cinnamon_fpga.Emulator(
+    #     context,
+    #     target="sw_emu",
+    #     xclbin_path=ROOT_DIR / "build" / "sw_emu" / "cinnamon_fpga.sw_emu.xclbin",
+    #     board_indices=[0],
+    #     require_kernel_execution=True,
+    #     verify_kernel_results=True,
+    # )
+
     runtime = cinnamon_fpga.Emulator(
         context,
-        target="sw_emu",
-        xclbin_path=ROOT_DIR / "build" / "sw_emu" / "cinnamon_fpga.sw_emu.xclbin",
+        target="hw",
+        xclbin_path=ROOT_DIR / "build" / "hw_50mhz" / "cinnamon_fpga.hw.xclbin",
         board_indices=[0],
         require_kernel_execution=True,
         verify_kernel_results=True,

@@ -17,7 +17,6 @@ This directory contains the RTL-to-HLS migration baseline and FPGA runtime for C
   - generated assets:
     - `CinnamonHLS/kernels/generated_ntt_tables.hpp`
     - `CinnamonHLS/python/cinnamon_fpga/generated_ntt_tables.py`
-- Unit tests that mirror existing RTL test vectors.
 - Multi-kernel Vitis xclbin:
   - `cinnamon_memory`
   - `cinnamon_arithmetic`
@@ -38,137 +37,99 @@ This directory contains the RTL-to-HLS migration baseline and FPGA runtime for C
   - `get_kernel_outputs()`
 - `pyxrt` host path for `sw_emu`, `hw_emu`, and `hw` execution modes.
 
-## Build And Test HLS Models
+## Build HLS C++ Interface
 
 ```bash
 cmake -S CinnamonHLS -B CinnamonHLS/build/cpu
 cmake --build CinnamonHLS/build/cpu -j
-ctest --test-dir CinnamonHLS/build/cpu --output-on-failure
 ```
 
-## Build Kernel XCLBIN
+## Main Script Entry Points
 
 ```bash
-# sw_emu (single U55C board)
-CinnamonHLS/scripts/build_xclbin.sh sw_emu
+# 1. HLS csim only
+CinnamonHLS/scripts/run_csim.sh
 
-# hw_emu
-CinnamonHLS/scripts/build_xclbin.sh hw_emu
+# 2. sw_emu: build + smoke
+CinnamonHLS/scripts/run_sw_emu.sh
 
-# hw
-CinnamonHLS/scripts/build_xclbin.sh hw
+# 3. hw 50MHz build
+CinnamonHLS/scripts/run_hw_50mhz.sh
+
+# 4. hw inference run (queue + long runtime guard)
+CinnamonHLS/scripts/run_hw_inference.sh
 ```
 
 Platform default: `xilinx_u55c_gen3x16_xdma_3_202210_1`
 
-Link step默认会加载 `CinnamonHLS/config/hbm_memory_connectivity.cfg`，将
-`cinnamon_memory_1` 的 `instructions/inputs/outputs` 端口绑定到独立 HBM bank。
-如需切换配置，可在构建前设置 `CONNECTIVITY_CFG=/path/to/your.cfg`。
+`run_csim.sh` 说明：
 
-可选构建控制（便于硬件拥塞调参）：
-
-```bash
-# 仅编译 xo（不执行 link）
-BUILD_STAGE=compile COMPILE_FREQUENCY_MHZ=160 CinnamonHLS/scripts/build_xclbin.sh hw
-
-# 仅执行 link（复用已编译 xo）
-BUILD_STAGE=link LINK_FREQUENCY_MHZ=160 CinnamonHLS/scripts/build_xclbin.sh hw
-
-# 追加额外 link 配置（例如 vivado 实现策略）
-EXTRA_LINK_CFG=CinnamonHLS/config/hw_impl_high_effort.cfg CinnamonHLS/scripts/build_xclbin.sh hw
-```
-
-## Cleanup Generated Artifacts
+- 只跑 HLS `csim`
+- 默认覆盖全部 kernel
+- 日志放到 `CinnamonHLS/build/csim/`
+- HLS 工程目录生成在 `CinnamonHLS/.csim_prj_*`
+- 不再生成 `.kernel_validation_prj_*`
+- `automorphism` 支持用 `CINNAMON_AUTOMORPHISM_REPLAY_FILE=<fixture>` 直接重放真实 `sw_emu` dispatch
 
 ```bash
-# Preview deletions
-CinnamonHLS/scripts/cleanup_generated_artifacts.sh --dry-run
+# 默认全量
+CinnamonHLS/scripts/run_csim.sh
 
-# Apply cleanup
-CinnamonHLS/scripts/cleanup_generated_artifacts.sh
+# 只跑部分 kernel
+CINNAMON_CSIM_KERNELS=memory,arithmetic,automorphism CinnamonHLS/scripts/run_csim.sh
+
+# 用 sw_emu 导出的真实 automorphism fixture 做 replay
+CINNAMON_AUTOMORPHISM_REPLAY_FILE=/tmp/automorphism_replay_fixture.txt \
+CINNAMON_CSIM_KERNELS=automorphism \
+CinnamonHLS/scripts/run_csim.sh
 ```
 
-This removes generated logs and temporary HLS/Vitis project products while preserving
-`CinnamonHLS/build/reports/` and committed source assets.
+`run_sw_emu.sh` 说明：
 
-## Run Python sw_emu Smoke
+- `MODE=full`：编译 `sw_emu` 并跑 smoke
+- `MODE=build`：只编译
+- `MODE=run`：只跑 smoke
+- `RUN_TARGET=smoke|tutorial_rot`
+- 当 `RUN_TARGET=tutorial_rot` 且设置 `CINNAMON_AUTOMORPHISM_REPLAY_FILE=<fixture>` 时，会在真实 `automorphism` dispatch 后写出 replay fixture
 
 ```bash
-export PYTHONPATH=/opt/xilinx/xrt/python:CinnamonHLS/python:$PYTHONPATH
-CinnamonHLS/scripts/run_sw_emu_smoke.sh
+CinnamonHLS/scripts/run_sw_emu.sh
+MODE=build CinnamonHLS/scripts/run_sw_emu.sh
+MODE=run CinnamonHLS/scripts/run_sw_emu.sh
+
+# 跑真实 rotate workload，并导出 automorphism replay fixture
+CINNAMON_AUTOMORPHISM_REPLAY_FILE=/tmp/automorphism_replay_fixture.txt \
+RUN_TARGET=tutorial_rot \
+MODE=run \
+CinnamonHLS/scripts/run_sw_emu.sh
 ```
 
-## Run Tutorial3 sw_emu Debug Baseline
+`run_hw_50mhz.sh` 说明：
 
-固定调试基线（`chips=1, boards=0, warmup=0, runs=1, sample_id=1, strict golden`）：
+- 固定 `hw`
+- 默认 compile/link 都是 `50 MHz`
+- 输出目录默认是 `CinnamonHLS/build/hw_50mhz`
 
 ```bash
-# args: [xclbin] [sample_id] [mismatch_dump_dir]
-CinnamonHLS/scripts/run_tutorial3_swemu_debug.sh \
-  CinnamonHLS/build/sw_emu/cinnamon_fpga.sw_emu.xclbin \
-  1 \
-  CinnamonHLS/build/reports/mismatch_swemu_debug
+CinnamonHLS/scripts/run_hw_50mhz.sh
+BUILD_STAGE=compile CinnamonHLS/scripts/run_hw_50mhz.sh
+BUILD_STAGE=link CinnamonHLS/scripts/run_hw_50mhz.sh
 ```
 
-失败时会自动落盘：
+`run_hw_inference.sh` 说明：
 
-- 完整 mismatch 证据 JSON（含 first mismatch + expected/actual 全量 output words）
-- automorphism 回放 fixture（可用于 `test_kernel_descriptor` 单模块复现）
-- instructions/program_inputs/evalkeys/golden 的时间戳归档目录
-
-## Run Full-Opcode Dispatch Check
-
-This check uses a synthetic instruction stream containing all supported opcodes and verifies
-that runtime dispatch reaches all compute kernels:
-
-- `memory`
-- `arithmetic`
-- `montgomery`
-- `ntt`
-- `base_conv`
-- `automorphism`
-- `transpose`
+- 跑 `benchmark_tutorial3_inference.py` 的 `hw` 路径
+- 自动复用 `scripts/queue_hw_run.sh`（设备 busy 自动重试）
+- 默认单次运行超时保护 `RUNTIME_TIMEOUT_SEC=28800`（8 小时）
+- 默认单个 kernel dispatch 超时保护 `DISPATCH_WAIT_TIMEOUT_MS=300000`（5 分钟）
 
 ```bash
-CinnamonHLS/scripts/run_full_opcode_dispatch.sh sw_emu \
-  CinnamonHLS/build/sw_emu/cinnamon_fpga.sw_emu.xclbin \
-  0
+CinnamonHLS/scripts/run_hw_inference.sh
+
+# 自定义超时、sample范围、并强制重新编译指令/输入
+RUNTIME_TIMEOUT_SEC=43200 DISPATCH_WAIT_TIMEOUT_MS=600000 SAMPLE_START=1 SAMPLE_END=5 FORCE_RECOMPILE=1 \
+CinnamonHLS/scripts/run_hw_inference.sh
 ```
-
-## Run End-To-End Backend Validation (Tutorial DSL -> Compiler -> FPGA Kernel -> Output Check)
-
-```bash
-# sw_emu: 1/2/4 partitions mapped to boards 0/1/2/3
-CinnamonHLS/scripts/run_fpga_backend_validation.sh sw_emu \
-  CinnamonHLS/build/sw_emu/cinnamon_fpga.sw_emu.xclbin \
-  1,2,4 \
-  0,1,2,3 \
-  CinnamonHLS/golden/tutorial_add_kernel_outputs.json
-
-# hw: single board first
-CinnamonHLS/scripts/run_fpga_backend_validation.sh hw \
-  CinnamonHLS/build/hw/cinnamon_fpga.hw.xclbin \
-  1 \
-  0 \
-  CinnamonHLS/golden/tutorial_add_kernel_outputs.json
-
-# hw: then 2 boards, then 4 boards
-CinnamonHLS/scripts/run_fpga_backend_validation.sh hw \
-  CinnamonHLS/build/hw/cinnamon_fpga.hw.xclbin \
-  2 \
-  0,1 \
-  CinnamonHLS/golden/tutorial_add_kernel_outputs.json
-
-CinnamonHLS/scripts/run_fpga_backend_validation.sh hw \
-  CinnamonHLS/build/hw/cinnamon_fpga.hw.xclbin \
-  4 \
-  0,1,2,3 \
-  CinnamonHLS/golden/tutorial_add_kernel_outputs.json
-```
-
-Validation script path:
-
-`CinnamonHLS/python/examples/validate_fpga_backend.py`
 
 ## Tutorial Usage (FPGA Backend)
 
@@ -207,6 +168,5 @@ python3.10 CinnamonHLS/python/examples/tutorial_add_fpga.py
 - Compiler output format is unchanged (`instructions*`, `program_inputs`).
 - `run_program` always dispatches partitions to FPGA kernels. Runtime CPU fallback is disabled.
 - `verify_kernel_results=True` checks per-module raw output words (status/header + full state image) and fails fast on mismatch.
-- `run_fpga_backend_validation.sh` compares runtime kernel outputs with fixed golden data in `CinnamonHLS/golden/`.
 - Input preparation (`generate_*`) still uses emulator in this phase.
 - Multi-board mode uses `1 partition = 1 board` via `board_indices`.

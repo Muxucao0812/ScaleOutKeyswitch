@@ -16,13 +16,13 @@ inline void execute_dispatch_module(const std::uint64_t *instructions,
 
   std::uint64_t checksum = kFnvOffset;
   for (std::uint32_t i = 0; i < instruction_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     checksum ^= instructions[i];
     checksum *= kFnvPrime;
   }
 
   for (std::uint32_t i = 0; i < input_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     checksum ^= (inputs[i] << 1U) | (inputs[i] >> 63U);
     checksum *= kFnvPrime;
   }
@@ -43,7 +43,7 @@ inline void execute_dispatch_module(const std::uint64_t *instructions,
   }
 
   for (std::uint32_t i = 4U; i < output_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     const std::uint32_t src_idx = i - 4U;
     outputs[i] = (src_idx < input_count) ? inputs[src_idx] : 0ULL;
   }

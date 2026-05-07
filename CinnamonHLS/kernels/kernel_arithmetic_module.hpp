@@ -161,7 +161,7 @@ inline void execute_arithmetic_module(const std::uint64_t *instructions,
   std::uint32_t register_handles[kMaxRegisters];
 #pragma HLS BIND_STORAGE variable = register_handles type = ram_2p impl = bram
   for (std::uint32_t i = 0; i < bounded_register_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     register_handles[i] = static_cast<std::uint32_t>(
         control[layout.register_handles_offset + i]);
   }
@@ -169,16 +169,12 @@ inline void execute_arithmetic_module(const std::uint64_t *instructions,
   constexpr std::uint32_t kMaxBcuUnits = 8U;
   std::uint32_t active_line_crc[kMaxBcuUnits];
   for (std::uint32_t i = 0; i < kMaxBcuUnits; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     active_line_crc[i] =
         (extra.valid && i < extra.bcu_active_count)
             ? static_cast<std::uint32_t>(control[extra.bcu_active_offset + i])
             : 0U;
   }
-
-  constexpr std::uint32_t kMaxCoeff = 2048U;
-  std::uint64_t sud_src1_ntt[kMaxCoeff];
-#pragma HLS BIND_STORAGE variable = sud_src1_ntt type = ram_2p impl = bram
 
   const std::uint32_t instruction_count =
       instruction_word_count / kInstructionWordStride;
@@ -234,17 +230,15 @@ inline void execute_arithmetic_module(const std::uint64_t *instructions,
         payload_handle_coeff_offset(layout, out_handle);
     const bool neg_op = (inst.opcode == kOpNeg);
     const bool con_op = (inst.opcode == kOpCon);
+    const std::uint64_t mod_mu = lookup_barrett_mu(mod);
     if (!neg_op && !con_op && !add_op && !sub_op && !sud_op) {
       status = kPayloadStatusUnsupportedOpcode;
       break;
     }
 
     std::uint64_t sud_divisor_inv = 1U;
+    std::uint32_t sud_src1_ntt_handle = src1_handle;
     if (sud_op) {
-      if (layout.coeff_count > kMaxCoeff) {
-        status = kPayloadStatusLayoutOverflow;
-        break;
-      }
       std::uint64_t divisor_mod = 0U;
       if (src1_is_bcu) {
         if (!extra.valid) {
@@ -272,7 +266,7 @@ inline void execute_arithmetic_module(const std::uint64_t *instructions,
         }
         divisor_mod = 1U;
         for (std::uint32_t k = 0U; k < src_count; ++k) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
           const std::uint32_t src_base_id =
               static_cast<std::uint32_t>(control[src_base_offset + k]);
           const std::uint64_t src_modulus =
@@ -281,19 +275,23 @@ inline void execute_arithmetic_module(const std::uint64_t *instructions,
             status = kPayloadStatusMissingModulus;
             break;
           }
-          divisor_mod = mod_mul(divisor_mod, src_modulus % mod, mod);
+          divisor_mod = mod_mul_reduced_precomputed(
+              divisor_mod, mod_reduce_precomputed(src_modulus, mod, mod_mu), mod,
+              mod_mu);
         }
         if (status != kPayloadStatusOk) {
           break;
         }
       } else {
+        const std::uint32_t src1_base_id =
+            payload_handle_rns_base_id(control, layout, src1_handle);
         const std::uint64_t src1_modulus =
-            payload_lookup_modulus(control, layout, rns_base_id);
+            payload_lookup_modulus(control, layout, src1_base_id);
         if (src1_modulus == 0U) {
           status = kPayloadStatusMissingModulus;
           break;
         }
-        divisor_mod = src1_modulus % mod;
+        divisor_mod = mod_reduce_precomputed(src1_modulus, mod, mod_mu);
       }
       sud_divisor_inv = mod_inv(divisor_mod, mod);
       if (sud_divisor_inv == 0U) {
@@ -304,32 +302,48 @@ inline void execute_arithmetic_module(const std::uint64_t *instructions,
       const bool src1_is_ntt =
           (payload_handle_flags(control, layout, src1_handle) &
            kPayloadFlagIsNtt) != 0U;
-      for (std::uint32_t coeff = 0U; coeff < layout.coeff_count; ++coeff) {
-#pragma HLS PIPELINE II = 1
-        sud_src1_ntt[coeff] = payload[src1_offset + coeff] % mod;
-      }
       if (!src1_is_ntt) {
-        ntt_apply_negacyclic_four_step(sud_src1_ntt, layout.coeff_count, mod,
-                                       rns_base_id, false);
+        sud_src1_ntt_handle = payload_allocate_handle(
+            control, layout, rns_base_id, true, status);
+        if (status != kPayloadStatusOk) {
+          break;
+        }
+        const std::uint32_t sud_src1_ntt_offset =
+            payload_handle_coeff_offset(layout, sud_src1_ntt_handle);
+        for (std::uint32_t coeff = 0U; coeff < layout.coeff_count; ++coeff) {
+#pragma HLS PIPELINE II = 4
+          payload[sud_src1_ntt_offset + coeff] =
+              mod_reduce_precomputed(payload[src1_offset + coeff], mod, mod_mu);
+        }
+        ntt_apply_negacyclic_four_step(&payload[sud_src1_ntt_offset],
+                                       layout.coeff_count, mod, rns_base_id,
+                                       false);
       }
     }
 
+    const std::uint32_t sud_src1_ntt_offset =
+        payload_handle_coeff_offset(layout, sud_src1_ntt_handle);
     for (std::uint32_t coeff = 0; coeff < layout.coeff_count; ++coeff) {
-#pragma HLS PIPELINE II = 1
-      const std::uint64_t a = payload[src0_offset + coeff] % mod;
+#pragma HLS PIPELINE II = 4
+      const std::uint64_t a =
+          mod_reduce_precomputed(payload[src0_offset + coeff], mod, mod_mu);
       std::uint64_t result = a;
       if (add_op) {
-        const std::uint64_t b = payload[src1_offset + coeff] % mod;
-        result = mod_add(a, b, mod);
+        const std::uint64_t b =
+            mod_reduce_precomputed(payload[src1_offset + coeff], mod, mod_mu);
+        result = mod_add_reduced_precomputed(a, b, mod, mod_mu);
       } else if (sub_op) {
-        const std::uint64_t b = payload[src1_offset + coeff] % mod;
-        result = mod_sub(a, b, mod);
+        const std::uint64_t b =
+            mod_reduce_precomputed(payload[src1_offset + coeff], mod, mod_mu);
+        result = mod_sub_reduced_precomputed(a, b, mod, mod_mu);
       } else if (sud_op) {
-        const std::uint64_t b = sud_src1_ntt[coeff] % mod;
-        const std::uint64_t diff = mod_sub(a, b, mod);
-        result = mod_mul(diff, sud_divisor_inv, mod);
+        const std::uint64_t b =
+            mod_reduce_precomputed(payload[sud_src1_ntt_offset + coeff], mod,
+                                  mod_mu);
+        const std::uint64_t diff = mod_sub_reduced_precomputed(a, b, mod, mod_mu);
+        result = mod_mul_reduced_precomputed(diff, sud_divisor_inv, mod, mod_mu);
       } else if (con_op) {
-        result = a % mod;
+        result = mod_reduce_precomputed(a, mod, mod_mu);
       } else if (neg_op) {
         result = (a == 0U) ? 0U : (mod - a);
       }
@@ -343,7 +357,7 @@ inline void execute_arithmetic_module(const std::uint64_t *instructions,
   }
 
   for (std::uint32_t i = 0; i < bounded_register_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     control[layout.register_handles_offset + i] = register_handles[i];
   }
 

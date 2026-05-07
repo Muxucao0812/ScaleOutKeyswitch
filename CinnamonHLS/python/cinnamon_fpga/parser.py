@@ -58,7 +58,7 @@ _OPCODE_NAMES = {v: k for k, v in _OPCODE_IDS.items()}
 _MODULE_ORDER = [
     "memory",
     "arithmetic",
-    "montgomery",
+    "modmul",
     "ntt",
     "base_conv",
     "automorphism",
@@ -70,7 +70,7 @@ _HOST_MANAGED_MODULE = "host_comm"
 _MODULE_IDS = {
     "memory": 1,
     "arithmetic": 2,
-    "montgomery": 3,
+    "modmul": 3,
     "ntt": 4,
     "base_conv": 5,
     "automorphism": 6,
@@ -80,7 +80,7 @@ _MODULE_IDS = {
 _MODULE_KERNELS = {
     "memory": "cinnamon_memory",
     "arithmetic": "cinnamon_arithmetic",
-    "montgomery": "cinnamon_montgomery",
+    "modmul": "cinnamon_modmul",
     "ntt": "cinnamon_ntt",
     "base_conv": "cinnamon_base_conv",
     "automorphism": "cinnamon_automorphism",
@@ -103,9 +103,9 @@ _OPCODE_TO_MODULE = {
     "sud": "arithmetic",
     "con": "arithmetic",
     "neg": "arithmetic",
-    "mul": "montgomery",
-    "mup": "montgomery",
-    "mus": "montgomery",
+    "mul": "modmul",
+    "mup": "modmul",
+    "mus": "modmul",
     "ntt": "ntt",
     "int": "ntt",
     "bci": "base_conv",
@@ -1147,19 +1147,8 @@ def _compute_trace(state: Sequence[int], register_count: int, module_id: int, ex
     return acc
 
 
-def _montgomery_reduce_ntt_friendly(a: int, q: int) -> int:
-    if q == 0:
-        return 0
-    r = 1 << (17 * 2)
-    r_mod_q = r % q
-    r_inv = _mod_inv(r_mod_q, q)
-    if r_inv == 0:
-        return a % q
-    return _mod_mul(a % q, r_inv, q)
-
-
-def _montgomery_mul_ntt_friendly(a: int, b: int, q: int) -> int:
-    return _montgomery_reduce_ntt_friendly(_mod_mul(a, b, q), q)
+# Modular multiplication uses Barrett reduction consistently with the HLS kernels.
+# Use _mod_mul directly.
 
 
 def _opcode_matches_module(module_id: int, opcode: int) -> bool:
@@ -1301,7 +1290,7 @@ def _apply_module_op(
 
     if module_id == 3:
         if op in (_OPCODE_IDS["mul"], _OPCODE_IDS["mup"], _OPCODE_IDS["mus"]):
-            return _montgomery_mul_ntt_friendly(src0, src1, mod)
+            return _mod_mul(src0, src1, mod)
         return src0
 
     if module_id == 4:
@@ -1320,7 +1309,7 @@ def _apply_module_op(
             return (int(inst.imm0) + int(inst.imm1) + int(inst.rns) + int(inst.aux & 0xFFFF)) % mod
         if op in (_OPCODE_IDS["pl1"], _OPCODE_IDS["bcw"]):
             factor = ((int(inst.rns) % mod) + 1) % mod
-            return _mod_add(_montgomery_mul_ntt_friendly(src0, factor, mod), int(inst.imm0), mod)
+            return _mod_add(_mod_mul(src0, factor, mod), int(inst.imm0), mod)
         if op == _OPCODE_IDS["rsi"]:
             return (_mod_add(src0, int(inst.imm0), mod) + int(inst.imm1)) % mod
         if op == _OPCODE_IDS["rsv"]:

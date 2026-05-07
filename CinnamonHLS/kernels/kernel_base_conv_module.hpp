@@ -65,6 +65,58 @@ inline bool payload_find_bci_entry(const std::uint64_t *control,
   return false;
 }
 
+inline std::uint32_t payload_summary_primary_count(std::uint64_t summary) {
+  return static_cast<std::uint32_t>(summary & 0xFFFFULL);
+}
+
+inline std::uint32_t payload_summary_secondary_count(std::uint64_t summary) {
+  return static_cast<std::uint32_t>((summary >> 16U) & 0xFFFFULL);
+}
+
+inline std::uint32_t payload_summary_primary_first(std::uint64_t summary) {
+  return static_cast<std::uint32_t>((summary >> 32U) & 0xFFFFULL);
+}
+
+inline std::uint32_t payload_summary_secondary_first(std::uint64_t summary) {
+  return static_cast<std::uint32_t>((summary >> 48U) & 0xFFFFULL);
+}
+
+inline bool payload_find_bci_entry_by_signature(
+    const std::uint64_t *control, std::uint32_t control_count,
+    const PayloadExtraLayout &extra, std::uint32_t target_bcu_id,
+    std::uint32_t target_dst_count, std::uint32_t target_src_count,
+    std::uint32_t target_dst_first, std::uint32_t target_src_first,
+    std::uint32_t &entry_cursor, std::uint32_t &entry_bcu_id,
+    std::uint32_t &src_count, std::uint32_t &dst_count,
+    std::uint32_t &src_base_offset, std::uint32_t &dst_base_offset,
+    std::uint32_t &factor_offset) {
+  std::uint32_t cursor = extra.bci_entries_offset;
+  for (std::uint32_t i = 0; i < extra.bci_entry_count; ++i) {
+#pragma HLS LOOP_TRIPCOUNT min = 1 max = 512
+    std::uint32_t line_crc = 0U;
+    std::uint32_t bcu_id = 0U;
+    std::uint32_t next_cursor = 0U;
+    if (!payload_decode_bci_entry(control, control_count, cursor, line_crc, bcu_id,
+                                  src_count, dst_count, src_base_offset,
+                                  dst_base_offset, factor_offset, next_cursor)) {
+      return false;
+    }
+    const std::uint32_t src_first =
+        (src_count > 0U) ? static_cast<std::uint32_t>(control[src_base_offset]) : 0U;
+    const std::uint32_t dst_first =
+        (dst_count > 0U) ? static_cast<std::uint32_t>(control[dst_base_offset]) : 0U;
+    if (bcu_id == target_bcu_id && src_count == target_src_count &&
+        dst_count == target_dst_count && src_first == target_src_first &&
+        dst_first == target_dst_first) {
+      entry_cursor = cursor;
+      entry_bcu_id = bcu_id;
+      return true;
+    }
+    cursor = next_cursor;
+  }
+  return false;
+}
+
 inline std::uint32_t resolve_base_conv_operand_handle(
     const std::uint64_t *control, const PayloadLayout &layout,
     const std::uint32_t *register_handles, const DecodedInstruction &inst,
@@ -137,7 +189,7 @@ inline void execute_base_conv_module(const std::uint64_t *instructions,
   std::uint32_t register_handles[kMaxRegisters];
 #pragma HLS BIND_STORAGE variable = register_handles type = ram_2p impl = bram
   for (std::uint32_t i = 0; i < bounded_register_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     register_handles[i] = static_cast<std::uint32_t>(
         control[layout.register_handles_offset + i]);
   }
@@ -145,7 +197,7 @@ inline void execute_base_conv_module(const std::uint64_t *instructions,
   constexpr std::uint32_t kMaxBcuUnits = 8U;
   std::uint32_t active_line_crc[kMaxBcuUnits];
   for (std::uint32_t i = 0; i < kMaxBcuUnits; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     active_line_crc[i] =
         (i < extra.bcu_active_count)
             ? static_cast<std::uint32_t>(control[extra.bcu_active_offset + i])
@@ -174,14 +226,25 @@ inline void execute_base_conv_module(const std::uint64_t *instructions,
           control, control_count, extra, static_cast<std::uint32_t>(inst.line_crc),
           entry_cursor, entry_bcu_id, src_count, dst_count, src_base_offset,
           dst_base_offset, factor_offset);
-      if (!found || entry_bcu_id != bcu_id || bcu_id >= extra.bcu_unit_count ||
-          bcu_id >= kMaxBcuUnits) {
+      const std::uint64_t list_summary = inst.aux;
+      const bool fallback_found =
+          (!found || entry_bcu_id != bcu_id) &&
+          payload_find_bci_entry_by_signature(
+              control, control_count, extra, bcu_id,
+              payload_summary_primary_count(list_summary),
+              payload_summary_secondary_count(list_summary),
+              static_cast<std::uint32_t>(inst.imm0),
+              static_cast<std::uint32_t>(inst.imm1),
+              entry_cursor, entry_bcu_id, src_count, dst_count,
+              src_base_offset, dst_base_offset, factor_offset);
+      if (((!found && !fallback_found) || entry_bcu_id != bcu_id) ||
+          bcu_id >= extra.bcu_unit_count || bcu_id >= kMaxBcuUnits) {
         status = kPayloadStatusMissingBciConfig;
         break;
       }
       active_line_crc[bcu_id] = static_cast<std::uint32_t>(inst.line_crc);
       for (std::uint32_t dst_idx = 0U; dst_idx < extra.bcu_output_capacity; ++dst_idx) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
         control[extra.bcu_table_offset + bcu_id * extra.bcu_output_capacity + dst_idx] =
             static_cast<std::uint64_t>(kPayloadInvalidHandle);
       }
@@ -228,7 +291,7 @@ inline void execute_base_conv_module(const std::uint64_t *instructions,
     const std::uint32_t src_rns_base_id = inst.rns;
     std::uint32_t src_pos = src_count;
     for (std::uint32_t k = 0U; k < src_count; ++k) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
       if (static_cast<std::uint32_t>(control[src_base_offset + k]) ==
           src_rns_base_id) {
         src_pos = k;
@@ -248,24 +311,32 @@ inline void execute_base_conv_module(const std::uint64_t *instructions,
         status = kPayloadStatusMissingModulus;
         break;
       }
+      const std::uint64_t src_mod_mu = lookup_barrett_mu(src_mod);
       normalized_src_handle =
           payload_allocate_handle(control, layout, src_rns_base_id, false, status);
       if (status != kPayloadStatusOk) {
         break;
       }
       const std::uint32_t src_offset = payload_handle_coeff_offset(layout, src_handle);
-      const std::uint32_t out_offset =
+      const std::uint32_t normalized_src_offset =
           payload_handle_coeff_offset(layout, normalized_src_handle);
       for (std::uint32_t coeff = 0; coeff < layout.coeff_count; ++coeff) {
-#pragma HLS PIPELINE II = 1
-        payload[out_offset + coeff] = payload[src_offset + coeff] % src_mod;
+#pragma HLS PIPELINE II = 4
+        payload[normalized_src_offset + coeff] =
+            mod_reduce_precomputed(payload[src_offset + coeff], src_mod, src_mod_mu);
       }
-      ntt_apply_negacyclic_four_step(&payload[out_offset], layout.coeff_count, src_mod,
-                                     src_rns_base_id, true);
+      ntt_apply_negacyclic_four_step(&payload[normalized_src_offset],
+                                     layout.coeff_count, src_mod, src_rns_base_id,
+                                     true);
+    } else {
+      if (payload_lookup_modulus(control, layout, src_rns_base_id) == 0U) {
+        status = kPayloadStatusMissingModulus;
+        break;
+      }
     }
-
-    const std::uint32_t src_offset =
+    const std::uint32_t normalized_src_offset =
         payload_handle_coeff_offset(layout, normalized_src_handle);
+
     for (std::uint32_t dst_idx = 0U; dst_idx < dst_count; ++dst_idx) {
       if (dst_idx >= extra.bcu_output_capacity) {
         status = kPayloadStatusBadExtraLayout;
@@ -278,8 +349,10 @@ inline void execute_base_conv_module(const std::uint64_t *instructions,
         status = kPayloadStatusMissingModulus;
         break;
       }
+      const std::uint64_t mod_mu = lookup_barrett_mu(mod);
       const std::uint32_t factor_idx = src_pos * dst_count + dst_idx;
-      const std::uint64_t factor = control[factor_offset + factor_idx] % mod;
+      const std::uint64_t factor =
+          mod_reduce_precomputed(control[factor_offset + factor_idx], mod, mod_mu);
       const std::uint32_t table_cursor =
           extra.bcu_table_offset + bcu_id * extra.bcu_output_capacity + dst_idx;
       std::uint32_t out_handle = static_cast<std::uint32_t>(control[table_cursor]);
@@ -289,12 +362,6 @@ inline void execute_base_conv_module(const std::uint64_t *instructions,
           break;
         }
         control[table_cursor] = out_handle;
-        const std::uint32_t out_offset =
-            payload_handle_coeff_offset(layout, out_handle);
-        for (std::uint32_t coeff = 0; coeff < layout.coeff_count; ++coeff) {
-#pragma HLS PIPELINE II = 1
-          payload[out_offset + coeff] = 0U;
-        }
       } else if (payload_handle_rns_base_id(control, layout, out_handle) != dst_base_id) {
         status = kPayloadStatusInvalidHandle;
         break;
@@ -302,11 +369,15 @@ inline void execute_base_conv_module(const std::uint64_t *instructions,
 
       const std::uint32_t out_offset = payload_handle_coeff_offset(layout, out_handle);
       for (std::uint32_t coeff = 0; coeff < layout.coeff_count; ++coeff) {
-#pragma HLS PIPELINE II = 1
-        const std::uint64_t src_coeff = payload[src_offset + coeff] % mod;
-        const std::uint64_t scaled = mod_mul(src_coeff, factor, mod);
+#pragma HLS PIPELINE II = 4
+        const std::uint64_t src_coeff =
+            mod_reduce_precomputed(payload[normalized_src_offset + coeff], mod, mod_mu);
+        const std::uint64_t scaled =
+            mod_mul_reduced_precomputed(src_coeff, factor, mod, mod_mu);
+        const std::uint64_t out_coeff =
+            mod_reduce_precomputed(payload[out_offset + coeff], mod, mod_mu);
         payload[out_offset + coeff] =
-            mod_add(payload[out_offset + coeff] % mod, scaled, mod);
+            mod_add_reduced_precomputed(out_coeff, scaled, mod, mod_mu);
       }
     }
     if (status != kPayloadStatusOk) {
@@ -316,11 +387,11 @@ inline void execute_base_conv_module(const std::uint64_t *instructions,
   }
 
   for (std::uint32_t i = 0; i < bounded_register_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     control[layout.register_handles_offset + i] = register_handles[i];
   }
   for (std::uint32_t i = 0; i < extra.bcu_active_count && i < kMaxBcuUnits; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     control[extra.bcu_active_offset + i] = active_line_crc[i];
   }
 

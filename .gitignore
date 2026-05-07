@@ -6,8 +6,11 @@
 
 v++_*.log
 *.backup.log
+*.jou
+*.str
 vitis_hls.log
 xcd.log
+/_x/
 
 __pycache__/
 *.pyc
@@ -17,6 +20,8 @@ __pycache__/
 /CinnamonHLS/.run/
 /CinnamonHLS/.Xil/
 /CinnamonHLS/.kernel_validation_prj_*/
+/CinnamonHLS/.csim_prj_*/
+/CinnamonHLS/.csim_projects/
 
 /CinnamonTutorial/notebook3/outputs/
 /CinnamonTutorial/notebook3/outputs_4ch/

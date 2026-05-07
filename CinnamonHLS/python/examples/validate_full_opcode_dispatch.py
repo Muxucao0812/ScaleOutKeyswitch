@@ -29,7 +29,7 @@ DEFAULT_REGISTER_FILE_SIZE = 1024
 EXPECTED_MODULE_ORDER = [
     "memory",
     "arithmetic",
-    "montgomery",
+    "modmul",
     "ntt",
     "base_conv",
     "automorphism",

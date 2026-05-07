@@ -67,16 +67,18 @@ inline void execute_transpose_module(const std::uint64_t *instructions,
 
     // Flattened column stream: in_cols[col * side + row]
     for (std::uint32_t j = 0U; j < block_words; ++j) {
-#pragma HLS PIPELINE II = 1
-      in_cols[j] = state[(src_base + j) % bounded_register_count] % mod;
+#pragma HLS PIPELINE II = 4
+      in_cols[j] =
+          mod_reduce(state[(src_base + j) % bounded_register_count], mod);
     }
 
     // TransposeFull behavior.
     transpose_full_stream(in_cols, full_cols, side, side);
 
     for (std::uint32_t j = 0U; j < block_words; ++j) {
-#pragma HLS PIPELINE II = 1
-      state[(dst_base + j) % bounded_register_count] = full_cols[j] % mod;
+#pragma HLS PIPELINE II = 4
+      state[(dst_base + j) % bounded_register_count] =
+          mod_reduce(full_cols[j], mod);
     }
 
     ++executed;

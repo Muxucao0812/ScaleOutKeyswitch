@@ -64,7 +64,7 @@ inline void execute_automorphism_module(const std::uint64_t *instructions,
   std::uint32_t register_handles[kMaxRegisters];
 #pragma HLS BIND_STORAGE variable = register_handles type = ram_2p impl = bram
   for (std::uint32_t i = 0; i < bounded_register_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     register_handles[i] = static_cast<std::uint32_t>(
         control[layout.register_handles_offset + i]);
   }
@@ -84,11 +84,15 @@ inline void execute_automorphism_module(const std::uint64_t *instructions,
       break;
     }
 
-    const std::uint32_t rns_base_id = inst.rns;
+    const std::uint32_t src_rns_base_id =
+        payload_handle_rns_base_id(control, layout, src_handle);
+    const bool src_is_ntt =
+        (payload_handle_flags(control, layout, src_handle) & kPayloadFlagIsNtt) != 0U;
+
     const std::uint32_t out_handle = payload_allocate_handle(
-        control, layout, rns_base_id,
-        (payload_handle_flags(control, layout, src_handle) & kPayloadFlagIsNtt) != 0U,
-        status);
+        control, layout, src_rns_base_id, src_is_ntt, status);
+
+
     if (status != kPayloadStatusOk) {
       break;
     }
@@ -115,7 +119,7 @@ inline void execute_automorphism_module(const std::uint64_t *instructions,
   }
 
   for (std::uint32_t i = 0; i < bounded_register_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     control[layout.register_handles_offset + i] = register_handles[i];
   }
 

@@ -156,7 +156,7 @@ inline std::uint64_t payload_trace(const std::uint32_t *register_handles,
   std::uint64_t acc = 0x9E3779B97F4A7C15ULL ^ static_cast<std::uint64_t>(module_id);
   acc ^= static_cast<std::uint64_t>(executed) << 16U;
   for (std::uint32_t i = 0; i < register_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     acc ^= hash_mix(static_cast<std::uint64_t>(register_handles[i]) ^
                     static_cast<std::uint64_t>(i + 1U));
     acc = rotl64(acc, 7U);
@@ -198,11 +198,11 @@ inline void write_payload_module_outputs(std::uint64_t *outputs,
   const std::uint32_t words_to_copy =
       (state_words_available < register_count) ? state_words_available : register_count;
   for (std::uint32_t i = 0; i < words_to_copy; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     outputs[kOutputHeaderWords + i] = register_handles[i];
   }
   for (std::uint32_t i = words_to_copy; i < state_words_available; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     outputs[kOutputHeaderWords + i] = 0ULL;
   }
 }
@@ -214,7 +214,7 @@ inline std::uint32_t payload_pair_lookup(const std::uint64_t *control,
   std::uint32_t lo = 0U;
   std::uint32_t hi = pair_count;
   while (lo < hi) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     const std::uint32_t mid = lo + ((hi - lo) >> 1U);
     const std::uint32_t cursor = pair_base + (mid << 1U);
     const std::uint64_t key = control[cursor];
@@ -237,7 +237,7 @@ inline bool payload_pair_update(std::uint64_t *control, std::uint32_t pair_base,
   std::uint32_t lo = 0U;
   std::uint32_t hi = pair_count;
   while (lo < hi) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     const std::uint32_t mid = lo + ((hi - lo) >> 1U);
     const std::uint32_t cursor = pair_base + (mid << 1U);
     const std::uint64_t key = control[cursor];
@@ -258,7 +258,7 @@ inline std::uint64_t payload_lookup_modulus(const std::uint64_t *control,
                                             const PayloadLayout &layout,
                                             std::uint32_t rns_base_id) {
   for (std::uint32_t i = 0; i < layout.rns_table_count; ++i) {
-#pragma HLS PIPELINE II = 1
+#pragma HLS PIPELINE II = 4
     const std::uint32_t cursor = layout.rns_table_offset + (i << 1U);
     if (static_cast<std::uint32_t>(control[cursor]) == rns_base_id) {
       return control[cursor + 1U];
